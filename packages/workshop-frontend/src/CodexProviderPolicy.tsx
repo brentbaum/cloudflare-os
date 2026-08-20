@@ -25,8 +25,10 @@ export function useCodexAdminCapability(
   const [admin, setAdmin] = useState<{ api: RpcStub<AdminApi> } | null>(null)
 
   useEffect(() => {
+    // Never expose a stub minted by the previous authenticated API while its replacement is
+    // pending. The cleanup below disposes it; clearing state also keeps children from calling it.
+    setAdmin(null)
     if (!isAdmin) {
-      setAdmin(null)
       return
     }
     let cancelled = false

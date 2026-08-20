@@ -92,4 +92,21 @@ describe('shared Codex provider policy', () => {
     expect(dispose).toHaveBeenCalledOnce()
     expect(container.textContent).toBe('')
   })
+
+  it('clears and disposes the old capability while a replacement is pending', async () => {
+    const oldDispose = vi.fn()
+    const oldAdmin = { [Symbol.dispose]: oldDispose } as unknown as RpcStub<AdminApi>
+    const replacement = deferred<RpcStub<AdminApi> | null>()
+    const oldApi = authenticatedApi({ getAdminApi: async () => oldAdmin })
+    const newApi = authenticatedApi({ getAdminApi: () => replacement.promise })
+
+    await act(async () => root.render(<CapabilityProbe api={oldApi} isAdmin />))
+    expect(container.textContent).toBe('admin-codex-card')
+    await act(async () => root.render(<CapabilityProbe api={newApi} isAdmin />))
+
+    expect(oldDispose).toHaveBeenCalledOnce()
+    expect(container.textContent).toBe('no-admin-card')
+    await act(async () => replacement.resolve(null))
+    expect(container.textContent).toBe('no-admin-card')
+  })
 })
