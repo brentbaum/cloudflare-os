@@ -21,6 +21,24 @@ function formatTime(timestamp: number): string {
   return new Date(timestamp).toLocaleString()
 }
 
+const STATUS_REASON_COPY: Record<string, string> = {
+  authorization_code_exchange_failed:
+    'OpenAI did not complete the sign-in. Start a new Codex connection.',
+  credential_encryption_failed:
+    'Codex could not securely save the new authorization. Check the wrapping-key configuration, then reconnect.',
+  credential_commit_failed:
+    'Codex could not finish saving the new authorization. Start a new connection before using the shared subscription.',
+}
+
+export function codexStatusReasonCopy(
+  status: Extract<CodexConnectionStatus,
+    { state: 'reauth-required' | 'credential-state-unknown' }>,
+): string {
+  return STATUS_REASON_COPY[status.reason] ?? (status.state === 'credential-state-unknown'
+    ? 'The saved Codex credential state cannot be verified safely. Reconnect before using it.'
+    : 'The shared Codex authorization is unavailable. Reconnect to restore access.')
+}
+
 /** Admin-only lifecycle UI for the deployment-wide Codex subscription connection. */
 export default function CodexConnectionCard({ adminApi, onConnectionChange }: Props) {
   const toasts = useKumoToastManager()
@@ -59,7 +77,10 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
       toasts.add({ title: 'Codex sign-in expired', variant: 'error' })
     } else if (result.state === 'superseded') {
       toasts.add({ title: 'A newer Codex sign-in replaced this attempt', variant: 'error' })
+    } else if (result.state === 'failed') {
+      toasts.add({ title: 'Codex sign-in failed. Start a new connection.', variant: 'error' })
     }
+    return nextStatus
   }, [onConnectionChange, toasts])
 
   const schedulePoll = useCallback((
@@ -82,25 +103,51 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
             : current)
           schedulePoll(api, attemptId, result.nextPollAt, generation)
         } else {
-          await finishAttempt(api, result, generation)
+          const nextStatus = await finishAttempt(api, result, generation)
           if (generation !== pollGeneration.current) return
+          if (nextStatus?.state === 'pending') {
+            schedulePoll(api, nextStatus.attemptId, nextStatus.nextPollAt, generation)
+          }
         }
       } catch (error) {
         if (generation !== pollGeneration.current) return
         console.error('Failed to poll Codex sign-in:', error)
         if (pollTimer.current !== null) clearTimeout(pollTimer.current)
         pollTimer.current = null
-        toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
         try {
           const nextStatus = await api.getCodexConnectionStatus()
           if (generation !== pollGeneration.current) return
           setStatus(nextStatus)
+          if (nextStatus.state === 'pending') {
+            setAttempt((current) => current?.attemptId === nextStatus.attemptId
+              ? {
+                  ...current,
+                  nextPollAt: nextStatus.nextPollAt,
+                  expiresAt: nextStatus.expiresAt,
+                }
+              : null)
+            schedulePoll(api, nextStatus.attemptId, nextStatus.nextPollAt, generation)
+            toasts.add({
+              title: 'Codex sign-in check was interrupted. Retrying automatically.',
+              variant: 'error',
+            })
+            return
+          }
+          setAttempt(null)
+          await onConnectionChange()
+          if (generation !== pollGeneration.current) return
+          if (nextStatus.state === 'ready') {
+            toasts.add({ title: 'Codex subscription connected', variant: 'success' })
+          } else {
+            toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
+          }
         } catch {
           if (generation !== pollGeneration.current) return
+          toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
         }
       }
     }, Math.max(0, nextPollAt - Date.now()))
-  }, [finishAttempt, toasts])
+  }, [finishAttempt, onConnectionChange, toasts])
 
   useEffect(() => {
     const generation = invalidateLifecycle()
@@ -204,6 +251,10 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
           <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-kumo-brand">
             <ArrowClockwise size={14} className="animate-spin" /> Waiting
           </span>
+        ) : status.state === 'reauth-required' ? (
+          <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-kumo-warning">
+            <WarningCircle size={14} /> Reconnect required
+          </span>
         ) : (
           <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-kumo-subtle">
             <LinkBreak size={14} /> Not connected
@@ -240,7 +291,7 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
       {(status.state === 'reauth-required' || status.state === 'credential-state-unknown') && (
         <div className="mt-3 flex items-start gap-2 rounded-lg bg-kumo-warning-tint p-3 text-[13px] leading-[18px] text-kumo-subtle">
           <WarningCircle size={15} className="mt-px shrink-0 text-kumo-warning" />
-          <span>{status.reason}</span>
+          <span>{codexStatusReasonCopy(status)}</span>
         </div>
       )}
 
@@ -252,7 +303,11 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
           </>
         ) : (
           <WorkshopButton tone="primary" onClick={startLogin} disabled={busy}>
-            {activeAttemptId ? 'Restart sign-in' : 'Connect Codex'}
+            {activeAttemptId
+              ? 'Restart sign-in'
+              : status.state === 'reauth-required' || status.state === 'credential-state-unknown'
+                ? 'Reconnect Codex'
+                : 'Connect Codex'}
           </WorkshopButton>
         )}
       </div>

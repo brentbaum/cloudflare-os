@@ -5,7 +5,11 @@ import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import type { AdminApi, CodexConnectionStatus } from '@gadgets/workshop-shared/api'
+import type {
+  AdminApi,
+  CodexConnectionStatus,
+  CodexDevicePollResult,
+} from '@gadgets/workshop-shared/api'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -31,7 +35,7 @@ vi.mock('./components/WorkshopControls', () => ({
   ),
 }))
 
-import CodexConnectionCard from './CodexConnectionCard'
+import CodexConnectionCard, { codexStatusReasonCopy } from './CodexConnectionCard'
 
 let container: HTMLDivElement
 let root: Root
@@ -71,6 +75,33 @@ async function render(
 }
 
 describe('CodexConnectionCard', () => {
+  it('maps sanitized credential reason codes to actionable admin copy', () => {
+    const cases = [
+      [
+        'authorization_code_exchange_failed',
+        'OpenAI did not complete the sign-in. Start a new Codex connection.',
+      ],
+      [
+        'credential_encryption_failed',
+        'Codex could not securely save the new authorization. Check the wrapping-key configuration, then reconnect.',
+      ],
+      [
+        'credential_commit_failed',
+        'Codex could not finish saving the new authorization. Start a new connection before using the shared subscription.',
+      ],
+    ] as const
+    for (const [reason, copy] of cases) {
+      expect(codexStatusReasonCopy({
+        state: 'reauth-required', connectionEpoch: 'epoch', reason,
+      })).toBe(copy)
+    }
+    expect(codexStatusReasonCopy({
+      state: 'credential-state-unknown', connectionEpoch: 'epoch', reason: 'sanitized_future_code',
+    })).toBe(
+      'The saved Codex credential state cannot be verified safely. Reconnect before using it.',
+    )
+  })
+
   it('stays absent when the deployment feature is disabled', async () => {
     await render(adminApi({
       getCodexConnectionStatus: async () => ({ state: 'disabled' }),
@@ -89,7 +120,8 @@ describe('CodexConnectionCard', () => {
     expect(container.textContent).toContain('Disconnect')
 
     status = {
-      state: 'credential-state-unknown', connectionEpoch: 'epoch-2', reason: 'Reconnect required.',
+      state: 'credential-state-unknown', connectionEpoch: 'epoch-2',
+      reason: 'credential_encryption_failed',
     }
     await act(async () => root.render(
       <CodexConnectionCard adminApi={api} onConnectionChange={() => {}} />,
@@ -98,8 +130,9 @@ describe('CodexConnectionCard', () => {
     await act(async () => root.unmount())
     root = createRoot(container)
     await render(api)
-    expect(container.textContent).toContain('Reconnect required.')
-    expect(container.textContent).toContain('Connect Codex')
+    expect(container.textContent).toContain('Codex could not securely save')
+    expect(container.textContent).not.toContain('credential_encryption_failed')
+    expect(container.textContent).toContain('Reconnect Codex')
   })
 
   it('shows the device code, polls one attempt, and refreshes models when ready', async () => {
@@ -136,6 +169,123 @@ describe('CodexConnectionCard', () => {
     expect(onConnectionChange).toHaveBeenCalledOnce()
     expect(container.textContent).toContain('Connected')
     expect(container.textContent).not.toContain('FAKE-CODE')
+  })
+
+  it.each([
+    {
+      label: 'denied',
+      result: { state: 'denied' },
+      status: { state: 'disconnected', connectionEpoch: 'epoch-1' },
+      toast: 'Codex sign-in was denied',
+    },
+    {
+      label: 'expired',
+      result: { state: 'expired' },
+      status: { state: 'disconnected', connectionEpoch: 'epoch-1' },
+      toast: 'Codex sign-in expired',
+    },
+    {
+      label: 'superseded',
+      result: { state: 'superseded' },
+      status: { state: 'pending', connectionEpoch: 'epoch-1', attemptId: 'newer-attempt',
+        expiresAt: 60_000, nextPollAt: 50_000 },
+      toast: 'A newer Codex sign-in replaced this attempt',
+    },
+  ] satisfies Array<{
+    label: string
+    result: CodexDevicePollResult
+    status: CodexConnectionStatus
+    toast: string
+  }>)('handles a $label terminal poll result distinctly', async ({ result, status, toast }) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>()
+      .mockResolvedValueOnce({
+        state: 'pending', connectionEpoch: 'epoch-0', attemptId: 'attempt-1',
+        expiresAt: 60_000, nextPollAt: 100,
+      })
+      .mockResolvedValueOnce(status)
+    const poll = vi.fn<AdminApi['pollCodexLogin']>(async () => result)
+    const onConnectionChange = vi.fn<() => Promise<void>>(async () => {})
+    await render(adminApi({ getCodexConnectionStatus: getStatus, pollCodexLogin: poll }),
+      onConnectionChange)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+
+    expect(poll).toHaveBeenCalledOnce()
+    expect(onConnectionChange).toHaveBeenCalledOnce()
+    expect(mocks.toast).toHaveBeenCalledWith({ title: toast, variant: 'error' })
+  })
+
+  it('handles a sanitized failed result as reconnect-required', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>()
+      .mockResolvedValueOnce({
+        state: 'pending', connectionEpoch: 'epoch-0', attemptId: 'attempt-1',
+        expiresAt: 60_000, nextPollAt: 100,
+      })
+      .mockResolvedValueOnce({
+        state: 'reauth-required', connectionEpoch: 'epoch-1',
+        reason: 'authorization_code_exchange_failed',
+      })
+    const poll = vi.fn<AdminApi['pollCodexLogin']>(async () => ({
+      state: 'failed', reconnectRequired: true,
+    }))
+    const onConnectionChange = vi.fn<() => Promise<void>>(async () => {})
+    await render(adminApi({ getCodexConnectionStatus: getStatus, pollCodexLogin: poll }),
+      onConnectionChange)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+
+    expect(poll).toHaveBeenCalledOnce()
+    expect(onConnectionChange).toHaveBeenCalledOnce()
+    expect(mocks.toast).toHaveBeenCalledWith({
+      title: 'Codex sign-in failed. Start a new connection.', variant: 'error',
+    })
+    expect(container.textContent).toContain('Reconnect required')
+    expect(container.textContent).toContain('OpenAI did not complete the sign-in')
+    expect(container.textContent).not.toContain('authorization_code_exchange_failed')
+  })
+
+  it('refreshes and reschedules a pending attempt after a transient poll rejection', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>()
+      .mockResolvedValueOnce({
+        state: 'pending', connectionEpoch: 'epoch-0', attemptId: 'attempt-1',
+        expiresAt: 60_000, nextPollAt: 100,
+      })
+      .mockResolvedValueOnce({
+        state: 'pending', connectionEpoch: 'epoch-0', attemptId: 'attempt-1',
+        expiresAt: 60_000, nextPollAt: 300,
+      })
+      .mockResolvedValueOnce({
+        state: 'ready', connectionEpoch: 'epoch-1', expiresAt: 60_000,
+      })
+    const poll = vi.fn<AdminApi['pollCodexLogin']>()
+      .mockRejectedValueOnce(new Error('unmistakably transient poll failure'))
+      .mockResolvedValueOnce({
+        state: 'ready', connectionEpoch: 'epoch-1', expiresAt: 60_000,
+      })
+    const onConnectionChange = vi.fn<() => Promise<void>>(async () => {})
+    await render(adminApi({ getCodexConnectionStatus: getStatus, pollCodexLogin: poll }),
+      onConnectionChange)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(poll).toHaveBeenCalledOnce()
+    expect(container.textContent).toContain('Waiting')
+    expect(mocks.toast).toHaveBeenCalledWith({
+      title: 'Codex sign-in check was interrupted. Retrying automatically.',
+      variant: 'error',
+    })
+    expect(vi.getTimerCount()).toBe(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(200) })
+    expect(poll).toHaveBeenCalledTimes(2)
+    expect(onConnectionChange).toHaveBeenCalledOnce()
+    expect(container.textContent).toContain('Connected')
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('ignores a pending start from an admin stub that has been replaced', async () => {
