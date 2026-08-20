@@ -11,6 +11,7 @@ const FAKE_ACCESS_AUD = "fake-preview-audience-for-tests";
 const FAKE_ACCESS_ISS = "https://fake-preview.cloudflareaccess.example";
 const FAKE_ADMIN = "fake-admin@example.invalid";
 const FAKE_WRAPPING_KEY = Buffer.alloc(32, 23).toString("base64");
+const FAKE_OAUTH_TOKEN = "fake-wrangler-oauth-token-for-tests-only";
 
 function namedEnvironment(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -19,6 +20,7 @@ function namedEnvironment(): NodeJS.ProcessEnv {
     "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID", "CF_AI_GATEWAY_API_TOKEN",
     "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_USE_BINDING",
   ]) delete env[key];
+  delete env.CLOUDFLARE_API_TOKEN;
   Object.assign(env, {
     PREVIEW_DEPLOY_MODE: "named",
     PREVIEW_NAME: "dry-run-only",
@@ -149,13 +151,17 @@ const fs = require("node:fs");
 const input = fs.readFileSync(0, "utf8");
 fs.appendFileSync(process.env.FAKE_COMMAND_LOG,
   JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2), input }) + "\\n");
+if (process.argv[2] === "auth" && process.argv[3] === "token") {
+  process.stdout.write(JSON.stringify({ type: "oauth", token: ${JSON.stringify(FAKE_OAUTH_TOKEN)} }));
+}
 `);
   chmodSync(fake, 0o755);
   writeFileSync(loader, `
 import fs from "node:fs";
 globalThis.fetch = async (url, init = {}) => {
   fs.appendFileSync(process.env.FAKE_FETCH_LOG,
-    JSON.stringify({ url: String(url), method: init.method || "GET" }) + "\\n");
+    JSON.stringify({ url: String(url), method: init.method || "GET",
+      authorized: init.headers?.Authorization === "Bearer ${FAKE_OAUTH_TOKEN}" }) + "\\n");
   return new Response(JSON.stringify({ success: true, result: [] }), {
     status: 200, headers: { "content-type": "application/json" },
   });
@@ -166,7 +172,6 @@ globalThis.fetch = async (url, init = {}) => {
     const env = namedEnvironment();
     Object.assign(env, {
       PREVIEW_WRANGLER: fake,
-      CLOUDFLARE_API_TOKEN: "fake-cloudflare-token-for-tests",
       FAKE_COMMAND_LOG: log,
       FAKE_FETCH_LOG: fetchLog,
       NODE_OPTIONS: `${env.NODE_OPTIONS ?? ""} --import=${loader}`.trim(),
@@ -178,8 +183,14 @@ globalThis.fetch = async (url, init = {}) => {
       timeout: 30_000,
     });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.ok(!result.stdout.includes(FAKE_OAUTH_TOKEN), "OAuth token reached command stdout");
+    assert.ok(!result.stderr.includes(FAKE_OAUTH_TOKEN), "OAuth token reached command stderr");
+    assert.ok(!readFileSync(log, "utf8").includes(FAKE_OAUTH_TOKEN),
+        "OAuth token reached the Wrangler command audit log");
     const calls = readFileSync(log, "utf8").trim().split("\n")
       .map((line) => JSON.parse(line) as { cwd: string; args: string[]; input: string });
+    assert.deepEqual(calls[0].args,
+        ["auth", "token", "--json", "-c", "wrangler.staging.jsonc"]);
     const workerDeletes = calls.filter(({ args }) => args[0] === "delete");
     assert.equal(workerDeletes.length, 20);
     assert.equal(workerDeletes[0].args[1], "dry-run-only-router");
@@ -199,11 +210,12 @@ globalThis.fetch = async (url, init = {}) => {
     assert.ok(calls.every(({ input }) => input === ""), "delete passed data on child stdin");
 
     const fetches = readFileSync(fetchLog, "utf8").trim().split("\n")
-      .map((line) => JSON.parse(line) as { url: string; method: string });
+      .map((line) => JSON.parse(line) as { url: string; method: string; authorized: boolean });
     assert.deepEqual(fetches, [{
       url: `https://api.cloudflare.com/client/v4/accounts/${"0".repeat(32)}/r2/buckets/` +
         "dry-run-only-workshop-backend-blueprint-content/objects?limit=1000",
       method: "GET",
+      authorized: true,
     }]);
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });

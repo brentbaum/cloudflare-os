@@ -98,6 +98,12 @@ interface WranglerPreviewJson {
   preview?: { id?: string; slug?: string; urls?: string[] };
 }
 
+/** The credential forms `wrangler auth token --json` can report. */
+interface WranglerAuthJson {
+  type?: "oauth" | "api_token" | "api_key";
+  token?: string;
+}
+
 /** One preview as the Cloudflare API lists it, for the sweep. */
 interface ListedPreview {
   /** The preview name: `pr<n>-<slugified branch>`, or the bare slug for a local deploy. */
@@ -228,10 +234,19 @@ function buildWorkspace(): Promise<void> {
       { cwd: ROOT, env: { ...process.env, VITE_CF_ACCESS_MODE: "true" } });
 }
 
-function preparePreviewWrangler(): PreviewWrangler {
+function preparePreviewWrangler(deployMode: PreviewDeployMode = "preview"): PreviewWrangler {
   const override = process.env.PREVIEW_WRANGLER;
   if (override) {
     return { command: override, ready: Promise.resolve(), cleanup: () => {} };
+  }
+  // Named mode uses no private-beta commands or config. Keep it on the repository's released,
+  // pinned Wrangler, whose `auth token --json` is also the supported bridge to a local OAuth login.
+  if (deployMode === "named") {
+    return {
+      command: join(ROOT, "node_modules", ".bin", "wrangler"),
+      ready: Promise.resolve(),
+      cleanup: () => {},
+    };
   }
 
   const installDir = mkdtempSync(join(tmpdir(), "preview-wrangler-"));
@@ -411,6 +426,37 @@ async function uploadNamedSecrets(
     throw new Error(`wrangler secret bulk failed for named worker ${readConfig(worker.dir).name} ` +
         `with exit code ${result.status}`);
   }
+}
+
+/**
+ * Resolve a Bearer token without persisting or displaying it. Wrangler's released `auth token`
+ * command reads the same OAuth login as ordinary deploy commands; `--json` suppresses its banner,
+ * and this caller deliberately never forwards the captured stdout/stderr to logs.
+ */
+async function namedCleanupBearerToken(
+  worker: DeployablePackage,
+  wranglerCommand: string,
+): Promise<string> {
+  if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
+  const result = await runWrangler(
+      worker, wranglerCommand, ["auth", "token", "--json", "-c", STAGING_CONFIG_NAME]);
+  if (result.status !== 0) {
+    throw new Error("named R2 cleanup needs Cloudflare authentication, but Wrangler could not " +
+        "retrieve its current OAuth token; run `wrangler login` or set CLOUDFLARE_API_TOKEN");
+  }
+  let credential: WranglerAuthJson;
+  try {
+    credential = JSON.parse(result.stdout) as WranglerAuthJson;
+  } catch {
+    // Never include stdout in this error: a malformed response could still contain a credential.
+    throw new Error("Wrangler returned an unreadable authentication response for named cleanup");
+  }
+  if ((credential.type !== "oauth" && credential.type !== "api_token") ||
+      typeof credential.token !== "string" || credential.token.length === 0) {
+    throw new Error("Wrangler authentication cannot provide the Bearer token named R2 cleanup " +
+        "requires; use Wrangler OAuth or CLOUDFLARE_API_TOKEN");
+  }
+  return credential.token;
 }
 
 async function runPreviewCommand(
@@ -697,7 +743,7 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
     return;
   }
 
-  const wrangler = preparePreviewWrangler();
+  const wrangler = preparePreviewWrangler(deployMode);
   try {
     await waitForAll([wrangler.ready, buildWorkspace()]);
 
@@ -779,13 +825,16 @@ async function remove({ dryRun }: { dryRun: boolean }): Promise<void> {
     return;
   }
 
-  const wrangler = preparePreviewWrangler();
+  const wrangler = preparePreviewWrangler(deployMode);
   try {
     await wrangler.ready;
     if (deployMode === "named") {
+      // Resolve auth before deleting a Worker: a missing OAuth session leaves the complete instance
+      // intact instead of deleting compute first and discovering that its R2 data cannot be cleaned.
+      const cleanupToken = await namedCleanupBearerToken(router, wrangler.command);
       await deleteNamedWorkers(packages, wrangler.command);
       await cleanupNamedResources(
-          router, wrangler.command, previewName, namedAutoResources(configs));
+          router, wrangler.command, previewName, namedAutoResources(configs), cleanupToken);
     } else {
       await deletePreviewFrom(packages, previewName, wrangler.command);
     }
@@ -804,14 +853,17 @@ const PREVIEW_MAX_AGE_DAYS = 7;
 
 async function cloudflareApi(
   path: string,
-  { method = "GET" }: { method?: "GET" | "DELETE" } = {},
+  { method = "GET", bearerToken = process.env.CLOUDFLARE_API_TOKEN }: {
+    method?: "GET" | "DELETE";
+    bearerToken?: string;
+  } = {},
 ): Promise<unknown> {
-  if (!process.env.CLOUDFLARE_API_TOKEN) {
+  if (!bearerToken) {
     throw new Error("CLOUDFLARE_API_TOKEN is required for preview API operations");
   }
   const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
     method,
-    headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+    headers: { Authorization: `Bearer ${bearerToken}` },
   });
   const body = await response.json().catch(() => ({})) as
       { success?: boolean; errors?: unknown; result?: unknown };
@@ -822,7 +874,11 @@ async function cloudflareApi(
   return body.result;
 }
 
-async function emptyNamedR2Bucket(accountId: string, bucketName: string): Promise<void> {
+async function emptyNamedR2Bucket(
+  accountId: string,
+  bucketName: string,
+  bearerToken: string,
+): Promise<void> {
   const bucketPath = `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}`;
   // The REST object API accepts the same API token as the deployment. Re-read page one after each
   // batch instead of trusting a cursor whose collection is being modified underneath it. The
@@ -830,7 +886,8 @@ async function emptyNamedR2Bucket(accountId: string, bucketName: string): Promis
   for (;;) {
     let listed: unknown;
     try {
-      listed = await cloudflareApi(`${bucketPath}/objects?limit=1000`);
+      listed = await cloudflareApi(
+          `${bucketPath}/objects?limit=1000`, { bearerToken });
     } catch (error) {
       if (/not found|does not exist|10006|10007/i.test(describe(error))) return;
       throw error;
@@ -850,7 +907,8 @@ async function emptyNamedR2Bucket(accountId: string, bucketName: string): Promis
       if (typeof key !== "string") {
         throw new Error(`R2 listed an object without a string key in ${bucketName}`);
       }
-      await cloudflareApi(`${bucketPath}/objects/${encodeURIComponent(key)}`, { method: "DELETE" });
+      await cloudflareApi(`${bucketPath}/objects/${encodeURIComponent(key)}`,
+          { method: "DELETE", bearerToken });
     });
   }
 }
@@ -861,6 +919,7 @@ async function cleanupNamedResources(
   wranglerCommand: string,
   previewName: string,
   resources: readonly NamedAutoResource[],
+  bearerToken: string,
 ): Promise<void> {
   // Validate the complete set before the first irreversible request, not lazily while deleting.
   assertNamedResourceScope(previewName, resources);
@@ -869,7 +928,9 @@ async function cleanupNamedResources(
   const failures: unknown[] = [];
   for (const resource of resources) {
     try {
-      if (resource.kind === "r2") await emptyNamedR2Bucket(accountId, resource.name);
+      if (resource.kind === "r2") {
+        await emptyNamedR2Bucket(accountId, resource.name, bearerToken);
+      }
       const args = resource.kind === "kv"
         ? ["kv", "namespace", "delete", resource.name, "-c", STAGING_CONFIG_NAME, "-y"]
         : resource.kind === "r2"
