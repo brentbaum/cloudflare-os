@@ -10,6 +10,59 @@ import type {
 import { sanitizeUpstreamResponse } from "./policy.js";
 import { CodexAuth } from "./vault.js";
 
+const RPC_DISPOSE = (Symbol as typeof Symbol & { readonly dispose: symbol }).dispose;
+
+function disposeRpcResult(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  const dispose = (value as Record<symbol, unknown>)[RPC_DISPOSE];
+  if (typeof dispose === "function") dispose.call(value);
+}
+
+function copyStatus(status: CodexRelayStatus): CodexRelayStatus {
+  switch (status.state) {
+    case "pending":
+      return {
+        state: "pending",
+        connectionEpoch: status.connectionEpoch,
+        attemptId: status.attemptId,
+        expiresAt: status.expiresAt,
+        nextPollAt: status.nextPollAt,
+      };
+    case "ready":
+      return {
+        state: "ready",
+        connectionEpoch: status.connectionEpoch,
+        expiresAt: status.expiresAt,
+      };
+    case "reauth-required":
+    case "credential-state-unknown":
+      return {
+        state: status.state,
+        connectionEpoch: status.connectionEpoch,
+        reason: status.reason,
+      };
+    case "disconnected":
+      return { state: "disconnected", connectionEpoch: status.connectionEpoch };
+  }
+}
+
+function copyPollResult(result: CodexDevicePollResult): CodexDevicePollResult {
+  switch (result.state) {
+    case "pending":
+      return { state: "pending", nextPollAt: result.nextPollAt, expiresAt: result.expiresAt };
+    case "ready":
+      return {
+        state: "ready",
+        connectionEpoch: result.connectionEpoch,
+        expiresAt: result.expiresAt,
+      };
+    case "denied":
+    case "expired":
+    case "superseded":
+      return { state: result.state };
+  }
+}
+
 /** Service-binding RPC entrypoint for subscription-backed Codex inference. */
 @validateRpc()
 export class CodexRelay extends WorkerEntrypoint<Cloudflare.Env> implements CodexRelayContract {
@@ -20,18 +73,42 @@ export class CodexRelay extends WorkerEntrypoint<Cloudflare.Env> implements Code
   }
 
   /** Return the connection's non-secret authentication status. */
-  status(connection: CodexConnectionKey): Promise<CodexRelayStatus> {
-    return this.#connection(connection).status();
+  async status(connection: CodexConnectionKey): Promise<CodexRelayStatus> {
+    const result = await this.#connection(connection).status();
+    try {
+      return copyStatus(result);
+    } finally {
+      disposeRpcResult(result);
+    }
   }
 
   /** Start a latest-login-wins device-authorization attempt. */
-  startLogin(connection: CodexConnectionKey): Promise<CodexDeviceAuthorization> {
-    return this.#connection(connection).startLogin();
+  async startLogin(connection: CodexConnectionKey): Promise<CodexDeviceAuthorization> {
+    const result = await this.#connection(connection).startLogin();
+    try {
+      return {
+        attemptId: result.attemptId,
+        userCode: result.userCode,
+        verificationUri: result.verificationUri,
+        expiresAt: result.expiresAt,
+        pollIntervalMs: result.pollIntervalMs,
+      };
+    } finally {
+      disposeRpcResult(result);
+    }
   }
 
   /** Perform at most one provider-paced poll for a login attempt. */
-  pollLogin(connection: CodexConnectionKey, attemptId: string): Promise<CodexDevicePollResult> {
-    return this.#connection(connection).pollLogin(attemptId);
+  async pollLogin(
+    connection: CodexConnectionKey,
+    attemptId: string,
+  ): Promise<CodexDevicePollResult> {
+    const result = await this.#connection(connection).pollLogin(attemptId);
+    try {
+      return copyPollResult(result);
+    } finally {
+      disposeRpcResult(result);
+    }
   }
 
   /** Erase credentials and rotate the connection epoch. */

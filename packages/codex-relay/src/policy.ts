@@ -401,6 +401,20 @@ export function sanitizeUpstreamResponse(response: Response): Response {
   }
   const upstream = response.body?.getReader();
   let downstreamCancelled = false;
+  let released = false;
+  const disposeSymbol = (Symbol as typeof Symbol & { readonly dispose: symbol }).dispose;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      upstream?.releaseLock();
+    } catch {
+      // A cross-RPC cancel can settle just after cleanup starts; disposal still owns the source.
+    } finally {
+      const dispose = (response as unknown as Record<symbol, unknown>)[disposeSymbol];
+      if (typeof dispose === "function") dispose.call(response);
+    }
+  };
   const isCancellationFailure = (error: unknown) => {
     if (!isRecord(error) || typeof error.message !== "string") return false;
     return /stream was cancel(?:l)?ed|operation was aborted|request was aborted|readablestream received over rpc disconnected prematurely/i.test(
@@ -415,13 +429,26 @@ export function sanitizeUpstreamResponse(response: Response): Response {
           async pull(controller) {
             try {
               const result = await upstream.read();
-              if (result.done) controller.close();
+              if (result.done) {
+                try {
+                  controller.close();
+                } finally {
+                  release();
+                }
+              }
               else controller.enqueue(result.value);
             } catch (error) {
               // reader.cancel() rejects an already-pending cross-RPC read. The downstream stream is
               // already canceled in that case, so surfacing the expected rejection is unhandled.
-              if (downstreamCancelled && isCancellationFailure(error)) return;
-              controller.error(error);
+              if (downstreamCancelled && isCancellationFailure(error)) {
+                release();
+                return;
+              }
+              try {
+                controller.error(error);
+              } finally {
+                release();
+              }
             }
           },
           async cancel(reason) {
@@ -430,12 +457,15 @@ export function sanitizeUpstreamResponse(response: Response): Response {
               await upstream.cancel(reason);
             } catch (error) {
               if (!isCancellationFailure(error)) throw error;
+            } finally {
+              release();
             }
           },
         },
         { highWaterMark: 0 },
       )
     : null;
+  if (!upstream) release();
   return new Response(body, {
     status: response.status,
     statusText: response.statusText,

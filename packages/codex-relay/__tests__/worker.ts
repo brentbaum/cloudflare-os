@@ -5,7 +5,7 @@ export { CodexAuth, CodexRelay, default } from "../src/index.js";
 
 type StreamMode = "complete" | "cancellable";
 type ExchangeMode = "success" | "malformed" | "server-error";
-type RefreshMode = "success" | "server-error";
+type RefreshMode = "success" | "server-error" | "rate-limited";
 
 let initialExpiresIn = 3600;
 let exchangeCalls = 0;
@@ -65,6 +65,11 @@ export class TestUpstream extends WorkerEntrypoint {
         await refreshGate;
         if (refreshMode === "server-error")
           return Response.json({ error: "server_error_fake" }, { status: 503 });
+        if (refreshMode === "rate-limited")
+          return Response.json({ error: "rate_limit_fake" }, {
+            status: 429,
+            headers: { "Retry-After": "1" },
+          });
         return Response.json(fakeCredential(refreshCalls + 1, 3600));
       }
       exchangeCalls++;

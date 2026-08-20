@@ -89,6 +89,54 @@ type StoredState =
 type PendingSecret = { deviceAuthId: string; userCode: string };
 type CredentialResolution = { credential: CodexCredential; refreshed: boolean };
 
+function sameEnvelope(left: EncryptedEnvelope, right: EncryptedEnvelope): boolean {
+  return left.version === right.version && left.keyId === right.keyId && left.iv === right.iv &&
+    left.ciphertext === right.ciphertext;
+}
+
+function samePendingState(current: StoredState, expected: PendingState): current is PendingState {
+  return current.state === "pending" && current.connectionEpoch === expected.connectionEpoch &&
+    current.attemptId === expected.attemptId && current.expiresAt === expected.expiresAt &&
+    current.nextPollAt === expected.nextPollAt &&
+    current.pollIntervalMs === expected.pollIntervalMs &&
+    sameEnvelope(current.pending, expected.pending);
+}
+
+function sameRefreshMarker(
+  left: RefreshMarker | undefined,
+  right: RefreshMarker | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.generation === right.generation && left.attemptId === right.attemptId &&
+    left.startedAt === right.startedAt;
+}
+
+function sameReadyState(current: StoredState, expected: ReadyState): current is ReadyState {
+  return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
+    current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
+    sameEnvelope(current.credential, expected.credential) &&
+    sameRefreshMarker(current.refresh, expected.refresh);
+}
+
+function ownsRefresh(
+  current: StoredState,
+  expected: ReadyState,
+  marker: RefreshMarker,
+): current is ReadyState {
+  return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
+    current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
+    sameEnvelope(current.credential, expected.credential) &&
+    current.refresh?.generation === marker.generation &&
+    current.refresh.attemptId === marker.attemptId &&
+    current.refresh.startedAt === marker.startedAt;
+}
+
+function ownsExchange(current: StoredState, marker: StoredState): boolean {
+  return marker.state === "reauth-required" && current.state === "reauth-required" &&
+    current.connectionEpoch === marker.connectionEpoch &&
+    current.attemptId === marker.attemptId && current.reason === marker.reason;
+}
+
 class AuthStateError extends Error {
   constructor(
     public readonly code:
@@ -315,6 +363,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         "pending",
       );
     } catch {
+      const current = await this.#readRawState();
+      if (!samePendingState(current, state)) return { state: "superseded" };
       await this.#writeState({
         version: STATE_VERSION,
         state: "credential-state-unknown",
@@ -375,7 +425,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       );
     } catch (error) {
       const afterFailure = await this.#readRawState();
-      if (afterFailure.state !== "reauth-required" || afterFailure.attemptId !== attemptId) {
+      if (!ownsExchange(afterFailure, exchangeMarker)) {
         return { state: "superseded" };
       }
       if (error instanceof OAuthProtocolError && error.kind === "transient") {
@@ -389,7 +439,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       return { state: "superseded" };
     }
     const afterExchange = await this.#readRawState();
-    if (afterExchange.state !== "reauth-required" || afterExchange.attemptId !== attemptId) {
+    if (!ownsExchange(afterExchange, exchangeMarker)) {
       return { state: "superseded" };
     }
 
@@ -398,13 +448,13 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       encrypted = await keyring.encrypt(credential, this.#objectId, STATE_VERSION, "credential");
     } catch {
       const afterFailure = await this.#readRawState();
-      if (afterFailure.state === "reauth-required" && afterFailure.attemptId === attemptId) {
+      if (ownsExchange(afterFailure, exchangeMarker)) {
         await this.#writeState({ ...exchangeMarker, reason: "credential_encryption_failed" });
       }
       return { state: "superseded" };
     }
     const afterEncryption = await this.#readRawState();
-    if (afterEncryption.state !== "reauth-required" || afterEncryption.attemptId !== attemptId) {
+    if (!ownsExchange(afterEncryption, exchangeMarker)) {
       return { state: "superseded" };
     }
     const connectionEpoch = newId();
@@ -420,7 +470,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch {
       try {
         const afterFailure = await this.#readRawState();
-        if (afterFailure.state === "reauth-required" && afterFailure.attemptId === attemptId) {
+        if (ownsExchange(afterFailure, exchangeMarker)) {
           await this.#writeState({ ...exchangeMarker, reason: "credential_commit_failed" });
         }
       } catch {
@@ -448,6 +498,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         "credential",
       );
     } catch {
+      const current = await this.#readRawState();
+      if (!sameReadyState(current, state)) throw new AuthStateError("disconnected");
       await this.#writeState({
         version: STATE_VERSION,
         state: "credential-state-unknown",
@@ -482,7 +534,9 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       startedAt: Date.now(),
     };
     this.#activeRefreshAttempt = attemptId;
-    await this.#writeState({ ...state, refresh: marker });
+    const beforeMarker = await this.#readRawState();
+    if (!sameReadyState(beforeMarker, state)) throw new AuthStateError("disconnected");
+    await this.#writeState({ ...beforeMarker, refresh: marker });
 
     let refreshed: CodexCredential;
     try {
@@ -492,6 +546,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         this.#providerFetch,
       );
     } catch (error) {
+      const current = await this.#readRawState();
+      if (!ownsRefresh(current, state, marker)) throw new AuthStateError("disconnected");
       if (error instanceof OAuthProtocolError && error.kind === "invalid-grant") {
         await this.#writeState({
           version: STATE_VERSION,
@@ -502,7 +558,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         throw new AuthStateError("reauth_required");
       }
       if (error instanceof OAuthProtocolError && error.kind === "transient") {
-        await this.#writeState(state);
+        const { refresh: _refresh, ...restored } = current;
+        await this.#writeState(restored);
         throw new AuthStateError("refresh_failed");
       }
       await this.#writeState({
@@ -515,12 +572,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     }
 
     const current = await this.#readRawState();
-    if (
-      current.state !== "ready" ||
-      current.connectionEpoch !== state.connectionEpoch ||
-      current.generation !== state.generation ||
-      current.refresh?.attemptId !== attemptId
-    ) {
+    if (!ownsRefresh(current, state, marker)) {
       throw new AuthStateError("disconnected");
     }
     const keyring = await this.#keyringPromise;
@@ -528,6 +580,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     try {
       encrypted = await keyring.encrypt(refreshed, this.#objectId, STATE_VERSION, "credential");
     } catch {
+      const afterFailure = await this.#readRawState();
+      if (!ownsRefresh(afterFailure, state, marker)) throw new AuthStateError("disconnected");
       await this.#writeState({
         version: STATE_VERSION,
         state: "credential-state-unknown",
@@ -535,6 +589,10 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         reason: "refresh_encryption_failed",
       });
       throw new AuthStateError("credential_state_unknown");
+    }
+    const afterEncryption = await this.#readRawState();
+    if (!ownsRefresh(afterEncryption, state, marker)) {
+      throw new AuthStateError("disconnected");
     }
     const next: ReadyState = {
       version: STATE_VERSION,
@@ -547,6 +605,19 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     try {
       await this.#writeState(next);
     } catch {
+      let afterFailure: StoredState;
+      try {
+        afterFailure = await this.#readRawState();
+      } catch {
+        // The durable marker is still the only safe assumption when the commit cannot be read back.
+        throw new AuthStateError("credential_state_unknown");
+      }
+      if (sameReadyState(afterFailure, next)) {
+        return { credential: refreshed, refreshed: true };
+      }
+      if (!ownsRefresh(afterFailure, state, marker)) {
+        throw new AuthStateError("disconnected");
+      }
       try {
         await this.#writeState({
           version: STATE_VERSION,

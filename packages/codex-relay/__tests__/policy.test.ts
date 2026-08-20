@@ -20,6 +20,16 @@ function request(
   });
 }
 
+function trackDisposal(response: Response): { count: () => number } {
+  let disposals = 0;
+  const dispose = (Symbol as typeof Symbol & { readonly dispose: symbol }).dispose;
+  Object.defineProperty(response, dispose, {
+    configurable: true,
+    value: () => { disposals++ },
+  });
+  return { count: () => disposals };
+}
+
 describe("inference policy", () => {
   it("accepts the fixed SSE text/image shape and buffers it for safe pre-stream replay", async () => {
     const validated = await validateInferenceRequest(
@@ -231,11 +241,13 @@ describe("inference policy", () => {
         "X-Unapproved": "fake",
       },
     });
+    const disposal = trackDisposal(source);
     const sanitized = sanitizeUpstreamResponse(source);
     expect(sanitized.headers.get("set-cookie")).toBeNull();
     expect(sanitized.headers.get("x-unapproved")).toBeNull();
     expect(sanitized.headers.get("x-request-id")).toBe("request-fake");
     await expect(sanitized.text()).resolves.toBe("data: fake\n\n");
+    expect(disposal.count()).toBe(1);
   });
 
   it("propagates downstream cancellation to the upstream reader exactly once", async () => {
@@ -250,10 +262,12 @@ describe("inference policy", () => {
         },
       }),
     );
+    const disposal = trackDisposal(source);
     const reader = sanitizeUpstreamResponse(source).body?.getReader();
     expect(await reader?.read()).toMatchObject({ done: false });
     await reader?.cancel();
     expect(cancellations).toBe(1);
+    expect(disposal.count()).toBe(1);
   });
 
   it("suppresses only the expected rejection when cancellation races a pending read", async () => {
@@ -270,11 +284,13 @@ describe("inference policy", () => {
         },
       }),
     );
+    const disposal = trackDisposal(source);
     const reader = sanitizeUpstreamResponse(source).body?.getReader();
     const pending = reader?.read();
     await Promise.resolve();
     await reader?.cancel();
     await expect(pending).resolves.toMatchObject({ done: true });
+    expect(disposal.count()).toBe(1);
   });
 
   it("propagates a genuine upstream stream failure", async () => {
@@ -285,7 +301,16 @@ describe("inference policy", () => {
         },
       }),
     );
+    const disposal = trackDisposal(source);
     const reader = sanitizeUpstreamResponse(source).body?.getReader();
     await expect(reader?.read()).rejects.toThrow("fake genuine stream failure");
+    expect(disposal.count()).toBe(1);
+  });
+
+  it("disposes a bodyless upstream response immediately", () => {
+    const source = new Response(null, { status: 204 });
+    const disposal = trackDisposal(source);
+    expect(sanitizeUpstreamResponse(source).status).toBe(204);
+    expect(disposal.count()).toBe(1);
   });
 });

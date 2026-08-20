@@ -10,7 +10,7 @@ type TestUpstreamControl = {
   reset(): Promise<void>;
   setInitialExpiresIn(seconds: number): Promise<void>;
   setExchangeMode(mode: "success" | "malformed" | "server-error"): Promise<void>;
-  setRefreshMode(mode: "success" | "server-error"): Promise<void>;
+  setRefreshMode(mode: "success" | "server-error" | "rate-limited"): Promise<void>;
   blockRefresh(): Promise<void>;
   releaseRefresh(): Promise<void>;
   rejectNextInferenceAsUnauthorized(): Promise<void>;
@@ -34,6 +34,12 @@ const testEnv = env as unknown as {
 };
 
 const STATE_KEY = "codex-auth-state";
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((next) => { resolve = next });
+  return { promise, resolve };
+}
 
 function inferenceRequest(signal?: AbortSignal): Request {
   return new Request("https://caller.invalid/backend-api/codex/responses", {
@@ -131,6 +137,179 @@ describe("Codex relay in Workerd", () => {
     expect(responses.every((response) => response.status === 200)).toBe(true);
     await Promise.all(responses.map((response) => response.arrayBuffer()));
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
+  });
+
+  it("never lets a successful blocked refresh resurrect a disconnected connection", async () => {
+    const name = "disconnect-during-refresh";
+    await connect(name, 0);
+    const before = await testEnv.CODEX_RELAY.status(name);
+    await testEnv.CODEX_UPSTREAM.blockRefresh();
+
+    const inference = statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest()));
+    await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
+    await testEnv.CODEX_RELAY.disconnect(name);
+    const disconnected = await testEnv.CODEX_RELAY.status(name);
+    expect(disconnected.state).toBe("disconnected");
+    expect(disconnected.connectionEpoch).not.toBe(before.connectionEpoch);
+
+    await testEnv.CODEX_UPSTREAM.releaseRefresh();
+    await expect(inference).resolves.toBe(401);
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toEqual(disconnected);
+  });
+
+  it("never restores an old ready credential over a newer login after a refresh 429", async () => {
+    const name = "login-during-rate-limited-refresh";
+    await connect(name, 0);
+    await testEnv.CODEX_UPSTREAM.blockRefresh();
+    await testEnv.CODEX_UPSTREAM.setRefreshMode("rate-limited");
+
+    const inference = statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest()));
+    await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
+    const newer = await testEnv.CODEX_RELAY.startLogin(name);
+    await testEnv.CODEX_UPSTREAM.releaseRefresh();
+
+    await expect(inference).resolves.toBe(401);
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+      state: "pending",
+      attemptId: newer.attemptId,
+    });
+  });
+
+  it("rechecks refresh ownership after successful encryption before committing", async () => {
+    const name = "login-during-refresh-encryption";
+    const stub = await connect(name, 0);
+
+    await runInDurableObject(stub, async (instance) => {
+      const originalEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+      const encryptionStarted = deferred();
+      const releaseEncryption = deferred();
+      let encryptCalls = 0;
+      const encrypt = vi.spyOn(crypto.subtle, "encrypt").mockImplementation(async (...args) => {
+        encryptCalls++;
+        if (encryptCalls === 1) {
+          encryptionStarted.resolve();
+          await releaseEncryption.promise;
+        }
+        return originalEncrypt(...args);
+      });
+      try {
+        const inference = instance.infer(inferenceRequest());
+        await encryptionStarted.promise;
+        const newer = await instance.startLogin();
+        releaseEncryption.resolve();
+
+        await expect(statusAfterConsume(inference)).resolves.toBe(401);
+        await expect(instance.status()).resolves.toMatchObject({
+          state: "pending",
+          attemptId: newer.attemptId,
+        });
+      } finally {
+        releaseEncryption.resolve();
+        encrypt.mockRestore();
+      }
+    });
+  });
+
+  it("does not replace disconnect when a refresh commit fails after dispatch", async () => {
+    const name = "disconnect-during-refresh-commit";
+    const stub = await connect(name, 0);
+    const before = await stub.status();
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const storage = state.storage as unknown as {
+        put(key: string, value: unknown): Promise<void>;
+      };
+      const originalPut = storage.put.bind(storage);
+      const commitStarted = deferred();
+      const releaseCommit = deferred();
+      const put = vi.spyOn(storage, "put").mockImplementation(async (key, value) => {
+        if (
+          typeof value === "object" && value !== null && "state" in value &&
+          value.state === "ready" && "generation" in value && value.generation === 2
+        ) {
+          commitStarted.resolve();
+          await releaseCommit.promise;
+          throw new Error("fake delayed refresh commit fault");
+        }
+        await originalPut(key, value);
+      });
+      try {
+        const inference = instance.infer(inferenceRequest());
+        await commitStarted.promise;
+        await instance.disconnect();
+        releaseCommit.resolve();
+
+        await expect(statusAfterConsume(inference)).resolves.toBe(401);
+        const disconnected = await instance.status();
+        expect(disconnected.state).toBe("disconnected");
+        expect(disconnected.connectionEpoch).not.toBe(before.connectionEpoch);
+      } finally {
+        releaseCommit.resolve();
+        put.mockRestore();
+      }
+    });
+  });
+
+  it("does not replace a newer login when pending-secret decryption fails", async () => {
+    const name = "login-during-pending-decryption";
+    const stub = testEnv.CODEX_AUTH.getByName(name);
+    const original = await stub.startLogin();
+    await forcePollDue(stub);
+
+    await runInDurableObject(stub, async (instance) => {
+      const decryptionStarted = deferred();
+      const releaseDecryption = deferred();
+      const decrypt = vi.spyOn(crypto.subtle, "decrypt").mockImplementationOnce(async () => {
+        decryptionStarted.resolve();
+        await releaseDecryption.promise;
+        throw new Error("fake delayed pending decryption fault");
+      });
+      try {
+        const stalePoll = instance.pollLogin(original.attemptId);
+        await decryptionStarted.promise;
+        const newer = await instance.startLogin();
+        releaseDecryption.resolve();
+
+        await expect(stalePoll).resolves.toEqual({ state: "superseded" });
+        await expect(instance.status()).resolves.toMatchObject({
+          state: "pending",
+          attemptId: newer.attemptId,
+        });
+      } finally {
+        releaseDecryption.resolve();
+        decrypt.mockRestore();
+      }
+    });
+  });
+
+  it("does not replace disconnect when credential decryption fails", async () => {
+    const name = "disconnect-during-credential-decryption";
+    const stub = await connect(name);
+    const before = await stub.status();
+
+    await runInDurableObject(stub, async (instance) => {
+      const decryptionStarted = deferred();
+      const releaseDecryption = deferred();
+      const decrypt = vi.spyOn(crypto.subtle, "decrypt").mockImplementationOnce(async () => {
+        decryptionStarted.resolve();
+        await releaseDecryption.promise;
+        throw new Error("fake delayed credential decryption fault");
+      });
+      try {
+        const inference = instance.infer(inferenceRequest());
+        await decryptionStarted.promise;
+        await instance.disconnect();
+        releaseDecryption.resolve();
+
+        await expect(statusAfterConsume(inference)).resolves.toBe(401);
+        const disconnected = await instance.status();
+        expect(disconnected.state).toBe("disconnected");
+        expect(disconnected.connectionEpoch).not.toBe(before.connectionEpoch);
+      } finally {
+        releaseDecryption.resolve();
+        decrypt.mockRestore();
+      }
+    });
   });
 
   it("makes a new login authoritative and rejects stale attempt polls", async () => {
