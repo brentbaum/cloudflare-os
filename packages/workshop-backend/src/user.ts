@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, CodexConnectionStatus, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -12,6 +12,7 @@ import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { CODEX_QUICK_MODEL_ID, codexProfileId, getCodexConnectionStatus, isCodexProfileId, projectCodexModels, resolveCodexModel } from "./codex-provider.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -75,6 +76,25 @@ export type UserChatContext = {
   profile: AiChatAuthorInfo;
   aiModel?: UserAiModelRecord;
   quickModel?: AiModelConfig;
+}
+
+/** Resolve a saved shared-model selection only while it belongs to the current login epoch. */
+export function resolveCurrentCodexSelection(
+  profileId: string,
+  savedEpoch: string | null,
+  status: CodexConnectionStatus,
+) {
+  const model = resolveCodexModel(profileId, status);
+  return model?.config.connectionEpoch === savedEpoch ? model : undefined;
+}
+
+/** Catalog-pinned Luna fallback for quick work when the interactive selection is shared Codex. */
+export function resolveCodexQuickFallback(
+  selectedModelId: string | null,
+  status: CodexConnectionStatus | undefined,
+) {
+  if (!selectedModelId || !isCodexProfileId(selectedModelId) || !status) return undefined;
+  return resolveCodexModel(codexProfileId(CODEX_QUICK_MODEL_ID), status)?.config;
 }
 
 type LoginSessionRecord = {
@@ -198,7 +218,9 @@ function makeUserStorage(storage: DurableObjectStorage) {
         id: "user@example.com",
       },
       quickModel: <string | null>null,
+      quickModelCodexEpoch: <string | null>null,
       preferredModel: <string | null>null,
+      preferredModelCodexEpoch: <string | null>null,
       onboardingCompleted: false,
 
       // Set once the user's pre-existing workspaces have been asked to populate the outputs index
@@ -299,6 +321,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.adminSettings = this.ctx.exports.AdminSettings;
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  async #codexStatus(): Promise<CodexConnectionStatus> {
+    try {
+      return await getCodexConnectionStatus(this.env);
+    } catch {
+      logger.warn("shared Codex status unavailable", {
+        event: "codex.status.read.failed",
+      });
+      return { state: "disabled" };
+    }
   }
 
   async authenticate(token: string): Promise<void> {
@@ -526,21 +559,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
-    let result: AiChatAuthorInfo[] = [];
+    const codexModels = projectCodexModels(await this.#codexStatus());
+    let result: AiChatAuthorInfo[] = codexModels.map((entry) => entry.profile);
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.
     let gwConfig = getAiGatewayConfig(this.env);
-    let gwModelIds = new Set<string>();
+    let builtInModelIds = new Set(codexModels.map((entry) => entry.profile.id));
     if (gwConfig) {
       for (let entry of gwConfig.getModelList()) {
         result.push(entry);
-        gwModelIds.add(entry.id);
+        builtInModelIds.add(entry.id);
       }
     }
 
-    // Also include user-configured models, skipping any that duplicate a gateway model.
+    // Also include user-configured models, skipping any that duplicate a server-projected model.
     for (let model of this.storage.aiModels.list()) {
-      if (!gwModelIds.has(model.profile.id)) {
+      if (!builtInModelIds.has(model.profile.id)) {
         result.push(model.profile);
       }
     }
@@ -548,6 +582,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+    if (config.provider === "openai-codex" || isCodexProfileId(profile.id)) {
+      throw new Error("Shared Codex models are managed by the deployment administrator.");
+    }
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
@@ -558,6 +595,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
+    if (isCodexProfileId(id)) {
+      throw new Error("Shared Codex models cannot be deleted individually.");
+    }
     // In AI Gateway mode, don't allow deleting built-in suggested models.
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
@@ -572,11 +612,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async setQuickModel(id: string | null): Promise<void> {
-    this.storage.quickModel.put(id);
+    let connectionEpoch: string | null = null;
+    if (id && isCodexProfileId(id)) {
+      const model = resolveCodexModel(id, await this.#codexStatus());
+      if (!model) throw new Error("The shared Codex connection is unavailable.");
+      connectionEpoch = model.config.connectionEpoch;
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.storage.quickModelCodexEpoch.put(connectionEpoch);
+      this.storage.quickModel.put(id);
+    });
   }
 
   async getQuickModel(): Promise<null | string> {
     let result = this.storage.quickModel.get();
+    if (result && isCodexProfileId(result)) {
+      return resolveCurrentCodexSelection(
+          result, this.storage.quickModelCodexEpoch.get(), await this.#codexStatus())
+        ? result : null;
+    }
     if (result && this.storage.aiModels.get(result)) {
       return result;
     } else {
@@ -585,19 +639,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async getPreferredModel(): Promise<string | null> {
-    return this.storage.preferredModel.get();
+    const result = this.storage.preferredModel.get();
+    if (result && isCodexProfileId(result)) {
+      return resolveCurrentCodexSelection(
+          result, this.storage.preferredModelCodexEpoch.get(), await this.#codexStatus())
+        ? result : null;
+    }
+    return result;
   }
 
   async setPreferredModel(id: string | null): Promise<void> {
+    let connectionEpoch: string | null = null;
     if (id !== null) {
       // Validate that the model exists in the user's configured models or as a gateway model.
       let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
+      const codexModel = isCodexProfileId(id)
+        ? resolveCodexModel(id, await this.#codexStatus())
+        : undefined;
+      let exists = !!codexModel || !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
       if (!exists) {
         throw new Error(`No such model: ${id}`);
       }
+      connectionEpoch = codexModel?.config.connectionEpoch ?? null;
     }
-    this.storage.preferredModel.put(id);
+    this.ctx.storage.transactionSync(() => {
+      this.storage.preferredModelCodexEpoch.put(connectionEpoch);
+      this.storage.preferredModel.put(id);
+    });
   }
 
   async isOnboardingCompleted(): Promise<boolean> {
@@ -695,13 +763,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * via retryOnDoReset, so it must stay free of writes and side effects. */
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
     let gwConfig = getAiGatewayConfig(this.env);
+    const quickModelId = this.storage.quickModel.get();
+    const needsCodexStatus = (modelId !== null && isCodexProfileId(modelId)) ||
+        (quickModelId !== null && isCodexProfileId(quickModelId));
+    const codexStatus = needsCodexStatus ? await this.#codexStatus() : undefined;
 
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
+      if (isCodexProfileId(modelId)) {
+        result.aiModel = resolveCodexModel(modelId, codexStatus!);
+        if (!result.aiModel) {
+          throw new Error(
+              "The shared Codex connection is unavailable. Ask a deployment administrator to reconnect it.");
+        }
+      }
       // In AI Gateway mode, resolve gateway models first.
-      if (gwConfig) {
+      if (!result.aiModel && gwConfig) {
         result.aiModel = gwConfig.resolveModel(modelId);
       }
       if (!result.aiModel) {
@@ -710,27 +789,30 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }
 
-    // Resolve the quick model (used for lightweight tasks like title generation).
-    if (gwConfig) {
+    // Resolve the quick model (used for lightweight tasks like title generation). A valid explicit
+    // shared selection wins. When the interactive model is Codex but that selection is absent or
+    // stale, Luna is the catalog-pinned quick default and must beat AI Gateway's default.
+    if (quickModelId && isCodexProfileId(quickModelId)) {
+      result.quickModel = resolveCurrentCodexSelection(
+          quickModelId, this.storage.quickModelCodexEpoch.get(), codexStatus!)?.config;
+    } else if (quickModelId && (!gwConfig || (modelId !== null && isCodexProfileId(modelId)))) {
+      let quickModel = this.storage.aiModels.get(quickModelId) ?? gwConfig?.resolveModel(quickModelId);
+      if (quickModel) result.quickModel = quickModel.config;
+    }
+    result.quickModel ??= resolveCodexQuickFallback(modelId, codexStatus);
+    if (!result.quickModel && gwConfig) {
       // In AI Gateway mode, always use the hardcoded quick model.
       result.quickModel = gwConfig.getQuickModelConfig();
-    } else {
-      let quickModelId = this.storage.quickModel.get();
-      if (quickModelId) {
-        let quickModel = this.storage.aiModels.get(quickModelId);
-        if (quickModel) {
-          result.quickModel = quickModel.config;
-        }
-      }
     }
     return result;
   }
 
   async getExternalMessageChatContext(existingChatModelId: string | null): Promise<UserChatContext> {
     let models = await this.listModels();
+    const preferredModel = await this.getPreferredModel();
     // Prefer the existing chat's model, then the user's preferred model, then the first available model.
     let selectedModel = models.find(model => model.id === existingChatModelId)
-      ?? models.find(model => model.id === this.storage.preferredModel.get())
+      ?? models.find(model => model.id === preferredModel)
       ?? models[0];
 
     return this.getChatContext(selectedModel?.id ?? null);

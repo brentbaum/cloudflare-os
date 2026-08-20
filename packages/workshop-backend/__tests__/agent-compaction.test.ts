@@ -105,6 +105,12 @@ describe("compaction trigger", () => {
     expect(getModelTokenLimits({
       provider: "anthropic", model: "claude-opus-5", apiToken: "",
     })).toEqual({inputBudget: 1_000_000, maxOutputTokens: undefined});
+
+    // Codex limits are taken from Pi's pinned catalog rather than the API-key suggestions table.
+    expect(getModelTokenLimits({
+      provider: "openai-codex", model: "gpt-5.6-luna", connection: "shared-v1",
+      connectionEpoch: "epoch-1",
+    })).toEqual({inputBudget: 144_000, maxOutputTokens: 128_000});
   });
 
   // Workers AI rejects a request whose prompt and response cap together exceed the window, so a

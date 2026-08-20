@@ -1,11 +1,13 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import type { RpcStub } from 'capnweb'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  AiModelProvider,
+  AdminApi,
+  ApiKeyModelProvider,
   SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
 import {
@@ -18,12 +20,14 @@ import {
 import AddModelModal from '../AddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
+import CodexConnectionCard from '../CodexConnectionCard'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
-const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
+const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as ApiKeyModelProvider[]
+const CODEX_MODEL_PREFIX = 'openai-codex/'
 
 const PRIMARY_BTN =
   'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
@@ -35,13 +39,13 @@ const PRIMARY_BTN =
 function ModelRow({
   model,
   isQuick,
-  isBuiltIn,
+  management,
   onDelete,
   onSetQuick,
 }: {
   model: AiChatAuthorInfo
   isQuick: boolean
-  isBuiltIn: boolean
+  management: 'built-in' | 'shared' | 'custom'
   onDelete: () => void
   onSetQuick: () => void
 }) {
@@ -70,9 +74,9 @@ function ModelRow({
           <span className="truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">
             {model.name}
           </span>
-          {isBuiltIn && (
+          {management !== 'custom' && (
             <span className="shrink-0 rounded-full bg-kumo-tint px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-subtle">
-              built-in
+              {management}
             </span>
           )}
           {isQuick && (
@@ -105,7 +109,7 @@ function ModelRow({
               <Lightning size={13} className="mr-2" weight={isQuick ? 'fill' : 'regular'} />
               {isQuick ? 'Clear quick model' : 'Set as quick model'}
             </DropdownMenu.Item>
-            {!isBuiltIn && (
+            {management === 'custom' && (
               <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
                 <Trash size={13} className="mr-2" />
                 Delete provider
@@ -133,7 +137,7 @@ function Notice({ children }: { children: React.ReactNode }) {
 function ProvidersPage() {
   useDocumentTitle('AI Providers')
 
-  const { authenticatedApi } = useAuthenticatedApi()
+  const { authenticatedApi, isAdmin } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [quickModel, setQuickModel] = useState<string | null>(null)
@@ -143,8 +147,9 @@ function ProvidersPage() {
   const [loadError, setLoadError] = useState(false)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [admin, setAdmin] = useState<{ api: RpcStub<AdminApi> } | null>(null)
 
-  const fetchAll = async () => {
+  const fetchAll = useCallback(async () => {
     setLoadError(false)
     try {
       const [modelList, qm, cfg] = await Promise.all([
@@ -161,9 +166,36 @@ function ProvidersPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [authenticatedApi])
 
-  useEffect(() => { fetchAll() }, [authenticatedApi])
+  useEffect(() => { fetchAll() }, [fetchAll])
+
+  // Mint the existing admin capability only for administrators. The connection card never sits on
+  // the ordinary authenticated API, so non-admin browsers cannot invoke lifecycle operations.
+  useEffect(() => {
+    if (!isAdmin) {
+      setAdmin(null)
+      return
+    }
+    let cancelled = false
+    let stub: RpcStub<AdminApi> | null = null
+    authenticatedApi.getAdminApi().then((api) => {
+      if (cancelled) {
+        api?.[Symbol.dispose]?.()
+        return
+      }
+      if (api) {
+        stub = api
+        setAdmin({ api })
+      }
+    }).catch((error) => {
+      if (!cancelled) console.error('Failed to load Codex admin capability:', error)
+    })
+    return () => {
+      cancelled = true
+      stub?.[Symbol.dispose]?.()
+    }
+  }, [authenticatedApi, isAdmin])
 
   const gatewayMode = aiConfig?.enabled === true
 
@@ -172,6 +204,13 @@ function ProvidersPage() {
     const enabled = new Set((aiConfig as Extract<AiGatewayInfo, { enabled: true }>).enabledProviders)
     return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
   }
+
+  const modelManagement = (modelId: string): 'built-in' | 'shared' | 'custom' => {
+    if (modelId.startsWith(CODEX_MODEL_PREFIX)) return 'shared'
+    return isBuiltIn(modelId) ? 'built-in' : 'custom'
+  }
+
+  const hasSharedCodex = models.some((model) => model.id.startsWith(CODEX_MODEL_PREFIX))
 
   const handleDelete = async (model: AiChatAuthorInfo) => {
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
@@ -244,8 +283,10 @@ function ProvidersPage() {
       )}
 
       <div className="chat-panel flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pt-1 pb-16">
+        {isAdmin && <CodexConnectionCard adminApi={admin?.api ?? null} onConnectionChange={fetchAll} />}
+
         {/* Notices */}
-        {(gatewayMode || (!gatewayMode && models.length > 0)) && !loading && !loadError && (
+        {(gatewayMode || hasSharedCodex || (!gatewayMode && models.length > 0)) && !loading && !loadError && (
           <div className="flex flex-col gap-2.5 px-3 pb-2">
             {gatewayMode && (
               <Notice>
@@ -254,6 +295,17 @@ function ProvidersPage() {
                   <strong className="font-medium text-kumo-default">AI Gateway mode:</strong> built-in
                   models are managed by your deployment. You can still add custom models with your own
                   API tokens.
+                </span>
+              </Notice>
+            )}
+
+            {hasSharedCodex && (
+              <Notice>
+                <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
+                <span>
+                  <strong className="font-medium text-kumo-default">Shared Codex subscription:</strong>{' '}
+                  these models use the deployment administrator's connection for every authenticated
+                  user. Subscription usage and cost are not shown in AgentOS.
                 </span>
               </Notice>
             )}
@@ -314,7 +366,7 @@ function ProvidersPage() {
               <ModelRow
                 model={model}
                 isQuick={quickModel === model.id}
-                isBuiltIn={isBuiltIn(model.id)}
+                management={modelManagement(model.id)}
                 onDelete={() => handleDelete(model)}
                 onSetQuick={() => handleSetQuick(model.id)}
               />

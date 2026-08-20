@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { zstdDecompressSync } from "node:zlib";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
 
@@ -226,6 +227,98 @@ describe("getModel AI Gateway routing", () => {
     // Session affinity flows through (Workers AI models opt in to the affinity headers).
     expect(request.headers.get("x-session-affinity")).toBe("session-a");
   }, 15000);
+});
+
+describe("getModel shared Codex relay routing", () => {
+  it("locks external auth, payload, relay fetch, SSE, and response-body cancellation", async () => {
+    const within = <T>(promise: Promise<T>, label: string) => Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 500)),
+    ]);
+    const controller = new AbortController();
+    let capturedConnection: string | undefined;
+    let capturedRequest: Request | undefined;
+    let capturedBody: Record<string, unknown> | undefined;
+    let markDispatched!: () => void;
+    let markCancelled!: () => void;
+    const dispatched = new Promise<void>((resolve) => { markDispatched = resolve });
+    const cancelled = new Promise<void>((resolve) => { markCancelled = resolve });
+    let bodyController: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { bodyController = controller },
+      cancel() { markCancelled() },
+    });
+    const relay = {
+      infer: vi.fn(async (connection: string, request: Request) => {
+        capturedConnection = connection;
+        capturedRequest = request;
+        const requestBytes = new Uint8Array(await request.clone().arrayBuffer());
+        const bodyBytes = request.headers.get("content-encoding") === "zstd"
+          ? zstdDecompressSync(requestBytes)
+          : requestBytes;
+        capturedBody = JSON.parse(new TextDecoder().decode(bodyBytes)) as Record<string, unknown>;
+        request.signal.addEventListener("abort", () => {
+          markCancelled();
+          bodyController.error(request.signal.reason);
+        }, { once: true });
+        markDispatched();
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    } as unknown as NonNullable<Cloudflare.Env["CODEX_RELAY"]>;
+    const forbiddenFetch = vi.fn<typeof fetch>(async () => {
+      throw new Error("per-call fetch must not replace the relay");
+    });
+    const handle = getModel(env({
+      CODEX_SUBSCRIPTION_ENABLED: "true",
+      CODEX_RELAY: relay,
+    }), {
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      connection: "shared-v1",
+      connectionEpoch: "epoch-1",
+    }, INITIATOR, {
+      userGateway: { accountId: "must-not-route", apiKey: "must-not-route" },
+    });
+
+    const resultPromise = handle.stream(handle.model, {
+      messages: [{ role: "user", content: "hello", timestamp: 0 }],
+    }, {
+      signal: controller.signal,
+      fetch: forbiddenFetch,
+      transport: "websocket",
+      apiKey: "must-not-be-used",
+      headers: {
+        Authorization: "must-be-removed",
+        "chatgpt-account-id": "must-be-removed",
+      },
+    }).result();
+
+    const started = await within(Promise.race([
+      dispatched.then(() => ({ kind: "dispatched" as const })),
+      resultPromise.then((result) => ({ kind: "result" as const, result })),
+    ]), "relay dispatch");
+    if (started.kind === "result") {
+      throw new Error(`Codex stream stopped before relay dispatch: ${started.result.errorMessage}`);
+    }
+    expect(capturedConnection).toBe("shared-v1");
+    expect(capturedBody).toMatchObject({ model: "gpt-5.6-sol", stream: true, store: false });
+    expect(capturedRequest?.headers.get("authorization")).toBeNull();
+    expect(capturedRequest?.headers.get("chatgpt-account-id")).toBeNull();
+    expect(capturedRequest?.headers.get("accept")).toBe("text/event-stream");
+    expect(forbiddenFetch).not.toHaveBeenCalled();
+
+    // The relay has returned response headers while its SSE body remains open. Aborting the turn
+    // must cancel that body rather than leaving the Service Binding stream hanging.
+    controller.abort(new DOMException("fake cancellation", "AbortError"));
+    expect(capturedRequest?.signal.aborted).toBe(true);
+    await within(cancelled, "relay body cancellation");
+    const result = await within(resultPromise, "aborted Pi result");
+    expect(result.stopReason).toBe("aborted");
+  });
 });
 
 describe("getModel AI Gateway binding transport", () => {

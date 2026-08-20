@@ -1016,6 +1016,20 @@ export interface AdminApi {
 
   /** Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids. */
   setFormatOrder(blueprintIds: string[]): Promise<void>;
+
+  // --- Shared Codex subscription ---
+
+  /** Return the deployment's sanitized shared Codex connection state. */
+  getCodexConnectionStatus(): Promise<CodexConnectionStatus>;
+
+  /** Replace any pending attempt and begin a shared Codex device login. */
+  startCodexLogin(): Promise<CodexDeviceAuthorization>;
+
+  /** Poll one shared Codex device-login attempt once. */
+  pollCodexLogin(attemptId: string): Promise<CodexDevicePollResult>;
+
+  /** Delete the deployment's locally held shared Codex authority. */
+  disconnectCodex(): Promise<void>;
 }
 
 /** A partial edit to one promoted format. Absent fields are left alone. */
@@ -1132,21 +1146,24 @@ export type CloudflareAccountOption = {
   accountName: string;
 };
 
-/** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+/** AI providers configured with a per-model API key or provider-local endpoint. */
+export type ApiKeyModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+
+/** Supported AI providers, including the deployment-managed Codex subscription. */
+export type AiModelProvider = ApiKeyModelProvider | "openai-codex";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
   enabled: true;
-  enabledProviders: AiModelProvider[];
+  enabledProviders: ApiKeyModelProvider[];
 } | {
   enabled: false;
 };
 
-/** Configuration specifying how to connect to an AI model provider. */
-export type AiModelConfig = {
+/** Configuration for a user-added, API-key-backed model. */
+export type ApiKeyModelConfig = {
   /** Which AI provider hosts the model? */
-  provider: AiModelProvider;
+  provider: ApiKeyModelProvider;
 
   /** Name of the specific model, as specified to the provider's API. */
   model: string;
@@ -1168,6 +1185,35 @@ export type AiModelConfig = {
   apiUrl?: string;
 };
 
+/** Backend-generated configuration for a model using the private shared Codex relay. */
+export type CodexModelConfig = {
+  /** Distinguishes ChatGPT subscription inference from API-key OpenAI. */
+  provider: "openai-codex";
+
+  /** Upstream Codex catalog model ID. */
+  model: string;
+
+  /** Server-derived relay routing key. Browser callers are never allowed to persist this config. */
+  connection: "shared-v1";
+
+  /** Opaque login epoch used to invalidate defaults after disconnect and reconnect. */
+  connectionEpoch: string;
+};
+
+/** Configuration specifying how AgentOS reaches an AI model provider. */
+export type AiModelConfig = ApiKeyModelConfig | CodexModelConfig;
+
+/** Sanitized shared Codex state shown only through the deployment-admin capability. */
+export type CodexConnectionStatus =
+  | { state: "disabled" }
+  | import("./codex-relay.js").CodexRelayStatus;
+
+/** Device authorization instructions safe to show to a deployment administrator. */
+export type CodexDeviceAuthorization = import("./codex-relay.js").CodexDeviceAuthorization;
+
+/** Sanitized result of one administrator-triggered device-login poll. */
+export type CodexDevicePollResult = import("./codex-relay.js").CodexDevicePollResult;
+
 /**
  * Workers AI adds the response cap to the prompt and rejects a request whose total exceeds the
  * model's window, so every Cloudflare model reserves this much of it for the response.
@@ -1180,7 +1226,7 @@ export const WORKERS_AI_OUTPUT_LIMIT = 32768;
  * leaving the remainder as the prompt budget context compaction sizes against.
  */
 export const SUGGESTED_MODELS: Record<
-  AiModelProvider,
+  ApiKeyModelProvider,
   Record<string, {name: string, contextWindow: number, outputLimit?: number}>
 > = {
   "cloudflare": {

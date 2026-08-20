@@ -24,7 +24,11 @@ describe("assertChatAttachmentSupportedByProvider", () => {
       .not.toThrow();
     expect(() => assertChatAttachmentSupportedByProvider("openai", "image/jpeg", 1)).not.toThrow();
     expect(() => assertChatAttachmentSupportedByProvider("openai", "application/pdf", 1))
-      .not.toThrow();
+        .not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider("openai-codex", "image/png", 1))
+        .not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider("openai-codex", "application/pdf", 1))
+        .toThrow("Unsupported file type");
     expect(() => assertChatAttachmentSupportedByProvider("google", "application/pdf", 1))
       .not.toThrow();
     expect(() => assertChatAttachmentSupportedByProvider("google", "application/zip", 1))

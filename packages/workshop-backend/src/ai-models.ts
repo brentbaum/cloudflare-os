@@ -7,6 +7,8 @@ import type {
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
+import { stream as openaiCodexResponsesStream } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import type { OpenAICodexResponsesOptions } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as openaiResponsesStream } from "@earendil-works/pi-ai/api/openai-responses";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
@@ -15,11 +17,17 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
+import { AiChatAuthorInfo, AiModelConfig, ApiKeyModelConfig, CodexModelConfig,
+  SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
   from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
+import {
+  SHARED_CODEX_CONNECTION,
+  codexCatalogModel,
+  getCodexRelay,
+} from "./codex-provider.js";
 
  /**
   * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
@@ -119,6 +127,8 @@ function buildMetadata(initiator: AiChatAuthorInfo, context?: GatewayMetadataCon
 const API_STREAMS: Record<string, StreamFunction<Api, SimpleStreamOptions>> = {
   "anthropic-messages": anthropicMessagesStream as StreamFunction<Api, SimpleStreamOptions>,
   "openai-responses": openaiResponsesStream as StreamFunction<Api, SimpleStreamOptions>,
+  "openai-codex-responses":
+      openaiCodexResponsesStream as StreamFunction<Api, SimpleStreamOptions>,
   "openai-completions": openaiCompletionsStream as StreamFunction<Api, SimpleStreamOptions>,
   "google-generative-ai": googleGenerativeAiStream as StreamFunction<Api, SimpleStreamOptions>,
 };
@@ -143,7 +153,9 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
 // gaps for models we don't list, and unknown models get conservative defaults.
 function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined)
     : { contextWindow: number, maxTokens: number } {
-  const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
+  const suggested = config.provider === "openai-codex"
+      ? undefined
+      : SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
     contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
     maxTokens: suggested?.outputLimit ??
@@ -175,7 +187,7 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
 // thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Billing --
 // including unified billing on a user's own gateway -- is orthogonal to which API a request
 // speaks. Returns undefined for providers AI Gateway cannot serve (ollama).
-function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Api> | undefined {
+function gatewayNativeModel(config: ApiKeyModelConfig, gatewayUrl: string): Model<Api> | undefined {
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
   switch (config.provider) {
@@ -274,6 +286,9 @@ type HandleArgs = {
   // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
   // A per-call options.fetch still wins, which tests rely on to capture requests.
   fetch?: FetchFunction;
+  // Server-owned options which a browser/agent call must not override.
+  fixedOptions?: Partial<SimpleStreamOptions> &
+      Pick<OpenAICodexResponsesOptions, "authorization">;
 };
 
 function makeHandle(args: HandleArgs): ModelHandle {
@@ -312,7 +327,7 @@ function makeHandle(args: HandleArgs): ModelHandle {
             ? { "cf-aig-metadata": JSON.stringify(args.gatewayMetadata) }
             : {}),
       };
-      const merged: SimpleStreamOptions = {
+      const merged: SimpleStreamOptions & Pick<OpenAICodexResponsesOptions, "authorization"> = {
         // API defaults first, so an explicit per-call option can override them. `thinking: false`
         // replaces them with an explicit thinking-off request: for Anthropic pi sends
         // `thinking: {type:"disabled"}` (and knows to omit it for models that can't turn thinking
@@ -340,6 +355,9 @@ function makeHandle(args: HandleArgs): ModelHandle {
           const replaced = await options.onPayload?.(payload, payloadModel);
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
+        // Last by design: Codex relay routing, auth ownership, and SSE transport are server
+        // policy, not request options that an RPC caller can redirect or weaken.
+        ...args.fixedOptions,
       };
       return streamFn(model, context, merged);
     },
@@ -356,6 +374,12 @@ function makeHandle(args: HandleArgs): ModelHandle {
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
+  // Subscription traffic has its own private service binding and must never enter AI Gateway,
+  // unified-billing, or direct API-key routing.
+  if (config.provider === "openai-codex") {
+    return getCodexModel(env, config, options.sessionAffinity);
+  }
+
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
@@ -379,7 +403,7 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
 // Gateway. Supports every provider AI Gateway serves, including Workers AI. Billed to the
 // user's Cloudflare credits; no provider API key required.
 function getModelViaUserGateway(
-  config: AiModelConfig,
+  config: ApiKeyModelConfig,
   metadata: GatewayMetadata,
   userGateway: UserGatewayRouting,
   sessionAffinity?: string,
@@ -441,7 +465,7 @@ function bindingFetch(binding: Ai): FetchFunction {
 // Used only for requests that are NOT billed to a connected user's account.
 function getModelViaGateway(
   gwConfig: AiGatewayConfig,
-  config: AiModelConfig,
+  config: ApiKeyModelConfig,
   initiator: AiChatAuthorInfo,
   options: ModelRoutingOptions,
 ): ModelHandle {
@@ -505,7 +529,7 @@ function getModelViaGateway(
 }
 
 // Direct provider access using the credentials in the model config itself (no AI Gateway).
-function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelHandle {
+function getModelDirect(config: ApiKeyModelConfig, sessionAffinity?: string): ModelHandle {
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
   switch (config.provider) {
@@ -643,6 +667,44 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);
   }
+}
+
+// Subscription provider: the relay owns credentials and upstream policy. AgentOS contributes
+// only a catalog-pinned model descriptor and forwards the fully rendered Pi request through the
+// private service binding. Pi requires numeric cost coefficients, so ZERO_COST is only an internal
+// calculation sentinel: the provider UI labels money unavailable, and no AI Gateway cost-log route
+// is exposed.
+function getCodexModel(
+  env: Cloudflare.Env,
+  config: CodexModelConfig,
+  sessionAffinity?: string,
+): ModelHandle {
+  if (config.connection !== SHARED_CODEX_CONNECTION) {
+    throw new Error("Invalid shared Codex connection.");
+  }
+  const relay = getCodexRelay(env);
+  if (!relay) {
+    throw new Error("The shared Codex subscription provider is not configured.");
+  }
+  const catalog = codexCatalogModel(config.model);
+  const relayFetch: FetchFunction = (input, init) => {
+    const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+    return relay.infer(config.connection, request);
+  };
+
+  return makeHandle({
+    model: {
+      ...catalog,
+      cost: ZERO_COST,
+      input: ["text", "image"],
+    },
+    sessionAffinity,
+    fixedOptions: {
+      fetch: relayFetch,
+      transport: "sse",
+      authorization: { mode: "external" },
+    },
+  });
 }
 
 // =======================================================================================

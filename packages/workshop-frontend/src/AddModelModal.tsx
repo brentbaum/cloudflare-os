@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, ApiKeyModelConfig, ApiKeyModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -13,10 +13,10 @@ interface AddModelModalProps {
 }
 
 type SelectionType =
-  | { type: 'suggested', provider: AiModelProvider, modelId: string, displayName: string }
-  | { type: 'custom', provider: AiModelProvider }
+  | { type: 'suggested', provider: ApiKeyModelProvider, modelId: string, displayName: string }
+  | { type: 'custom', provider: ApiKeyModelProvider }
 
-const PROVIDER_LABELS: Record<AiModelProvider, string> = {
+const PROVIDER_LABELS: Record<ApiKeyModelProvider, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   google: 'Google',
@@ -25,7 +25,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
 }
 
 // Placeholder hinting at the shape of each provider's API token.
-const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
+const API_TOKEN_PLACEHOLDERS: Record<ApiKeyModelProvider, string> = {
   anthropic: 'sk-ant-...',
   openai: 'sk-...',
   google: 'AIza...',
@@ -38,23 +38,23 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
 const FALLBACK_EXAMPLE_MODEL = { modelId: 'gemma4:31b', name: 'Gemma 4 31B' }
 
 // Pick an example model to show in the custom-model placeholders for the given provider.
-function exampleModel(provider: AiModelProvider): { modelId: string, name: string } {
+function exampleModel(provider: ApiKeyModelProvider): { modelId: string, name: string } {
   const first = Object.entries(SUGGESTED_MODELS[provider])[0]
   return first ? { modelId: first[0], name: first[1].name } : FALLBACK_EXAMPLE_MODEL
 }
 
 // Encode a selection into a string value for the Select component.
-function encodeSelection(provider: AiModelProvider, modelId?: string): string {
+function encodeSelection(provider: ApiKeyModelProvider, modelId?: string): string {
   return modelId ? `${provider}:${modelId}` : `other-${provider}`
 }
 
 // Decode a Select value back into a SelectionType.
 function decodeSelection(value: string): SelectionType {
   if (value.startsWith('other-')) {
-    return { type: 'custom', provider: value.substring(6) as AiModelProvider }
+    return { type: 'custom', provider: value.substring(6) as ApiKeyModelProvider }
   }
   const colonIndex = value.indexOf(':')
-  const provider = value.substring(0, colonIndex) as AiModelProvider
+  const provider = value.substring(0, colonIndex) as ApiKeyModelProvider
   const modelId = value.substring(colonIndex + 1)
   const displayName = SUGGESTED_MODELS[provider][modelId].name
   return { type: 'suggested', provider, modelId, displayName }
@@ -63,7 +63,7 @@ function decodeSelection(value: string): SelectionType {
 // Build the flat list of options for the Select dropdown.
 function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null) {
   const options: { value: string; label: string; provider: string }[] = []
-  const providerOrder = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
+  const providerOrder = Object.keys(SUGGESTED_MODELS) as ApiKeyModelProvider[]
 
   for (const provider of providerOrder) {
     if (enabledProviders && !enabledProviders.has(provider)) continue
@@ -194,7 +194,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         name: finalDisplayName,
       }
 
-      const config: AiModelConfig = {
+      const config: ApiKeyModelConfig = {
         provider: selection!.provider,
         model: finalModelId,
         apiToken: gatewayMode ? '' : apiToken.trim(),
@@ -258,7 +258,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                   <div className="h-px bg-kumo-line my-1 mx-2" />
                 )}
                 <div className="px-3 py-1.5 text-xs font-medium text-kumo-subtle select-none">
-                  {PROVIDER_LABELS[group.provider as AiModelProvider] || group.provider}
+                  {PROVIDER_LABELS[group.provider as ApiKeyModelProvider] || group.provider}
                 </div>
                 {group.items.map(opt => (
                   <Select.Option key={opt.value} value={opt.value}>

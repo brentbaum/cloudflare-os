@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, CodexConnectionStatus, CodexDeviceAuthorization, CodexDevicePollResult, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -13,6 +13,7 @@ import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
+import { getCodexConnectionStatus, getCodexRelay, SHARED_CODEX_CONNECTION } from './codex-provider.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -566,7 +567,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
    * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
    * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string,
+      private env: Cloudflare.Env) {
     super();
   }
 
@@ -654,5 +656,27 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   setFormatOrder(blueprintIds: string[]): Promise<void> {
     return this.admin.setFormatOrder(blueprintIds);
+  }
+
+  getCodexConnectionStatus(): Promise<CodexConnectionStatus> {
+    return getCodexConnectionStatus(this.env);
+  }
+
+  startCodexLogin(): Promise<CodexDeviceAuthorization> {
+    const relay = getCodexRelay(this.env);
+    if (!relay) throw new Error("The shared Codex provider is disabled.");
+    return relay.startLogin(SHARED_CODEX_CONNECTION);
+  }
+
+  pollCodexLogin(attemptId: string): Promise<CodexDevicePollResult> {
+    const relay = getCodexRelay(this.env);
+    if (!relay) throw new Error("The shared Codex provider is disabled.");
+    return relay.pollLogin(SHARED_CODEX_CONNECTION, attemptId);
+  }
+
+  async disconnectCodex(): Promise<void> {
+    const relay = getCodexRelay(this.env);
+    if (!relay) throw new Error("The shared Codex provider is disabled.");
+    await relay.disconnect(SHARED_CODEX_CONNECTION);
   }
 }

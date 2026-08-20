@@ -1,4 +1,4 @@
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
+import { AiChatAuthorInfo, AiModelConfig, ApiKeyModelProvider, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
 import { UserAiModelRecord } from "./user.js";
 
 // The model used for quick tasks like title generation when AI Gateway mode is active.
@@ -119,7 +119,7 @@ export class AiGatewayConfig {
         return {
           profile: { type: "agent", id: modelId, name: models[modelId].name },
           config: {
-            provider: provider as AiModelConfig["provider"],
+            provider: provider as ApiKeyModelProvider,
             model: modelId,
             // apiToken and apiUrl are ignored when AI Gateway mode is active -- getModel()
             // reads the real values from env. We set them to empty strings here to satisfy

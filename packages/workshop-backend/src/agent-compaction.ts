@@ -4,6 +4,7 @@ import type {Api, Message, Model} from "@earendil-works/pi-ai";
 import * as Y from "yjs";
 import type {ChatBindingEntry, CompactionCheckpoint} from "./agent";
 import {zeroUsage} from "./ai-invoke";
+import {codexCatalogModel} from "./codex-provider";
 
 // Context compaction keeps long chats within the model's limit. It summarizes the messages before a
 // boundary and stores their replay state in a checkpoint. Canonical history keeps every message, so
@@ -27,6 +28,13 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
  */
 export function getModelTokenLimits(config: AiModelConfig):
     {inputBudget: number, maxOutputTokens?: number} {
+  if (config.provider === "openai-codex") {
+    const model = codexCatalogModel(config.model);
+    return {
+      inputBudget: model.contextWindow - model.maxTokens,
+      maxOutputTokens: model.maxTokens,
+    };
+  }
   let model = SUGGESTED_MODELS[config.provider][config.model];
   let maxOutputTokens = model?.outputLimit ??
       (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined);
