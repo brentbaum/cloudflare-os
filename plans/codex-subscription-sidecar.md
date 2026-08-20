@@ -1,8 +1,8 @@
 # AgentOS Codex Subscription Sidecar: Implementation Plan
 
-Status: engineering-reviewed and ready to execute in a fork  
-Target: `cloudflare/cloudflare-os` fork, pinned initially to `dd2b015071fe21de49fe2a68b57ef966dde15877`  
-Upstream issue: [cloudflare/cloudflare-os#89](https://github.com/cloudflare/cloudflare-os/issues/89)  
+Status: engineering-reviewed and ready to execute in a fork
+Target: `cloudflare/cloudflare-os` fork, pinned initially to `dd2b015071fe21de49fe2a68b57ef966dde15877`
+Upstream issue: [cloudflare/cloudflare-os#89](https://github.com/cloudflare/cloudflare-os/issues/89)
 Review date: 2026-08-20
 
 ## Outcome
