@@ -5,8 +5,10 @@ import type { Context } from "@earendil-works/pi-ai";
 import type {
   AdminApi,
   AiChatAuthorInfo,
+  AiChatMetadata,
   AuthenticatedApi,
   CodexModelConfig,
+  Overseer,
   PublicApi,
 } from "@gadgets/workshop-shared/api";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -50,6 +52,22 @@ const STATE_KEY = "codex-auth-state";
 const PASSWORD_HASH = new Uint8Array([11, 22, 33]);
 const CODEX_PROFILE_IDS = CODEX_MODEL_IDS.map(codexProfileId);
 
+type UserQuotaControl = {
+  consumeDailyLlmCall(limit: number): Promise<{
+    withinLimits: boolean;
+    remaining: number;
+    limit: number;
+    used: number;
+  }>;
+};
+
+const runtimeExports = workerExports as unknown as {
+  default: Fetcher;
+  UserDurableObject: {
+    getByName(name: string): UserQuotaControl;
+  };
+};
+
 async function bounded<T>(promise: PromiseLike<T>, label: string, timeoutMs = 3_000): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -65,7 +83,7 @@ async function bounded<T>(promise: PromiseLike<T>, label: string, timeoutMs = 3_
 }
 
 async function connect(): Promise<RpcStub<PublicApi>> {
-  const response = await workerExports.default.fetch(new Request("https://workshop.invalid/api", {
+  const response = await runtimeExports.default.fetch(new Request("https://workshop.invalid/api", {
     headers: { Upgrade: "websocket" },
   }));
   expect(response.status).toBe(101);
@@ -73,6 +91,19 @@ async function connect(): Promise<RpcStub<PublicApi>> {
   if (!socket) throw new TypeError("Expected the backend to return a WebSocket");
   socket.accept();
   return newWebSocketRpcSession<PublicApi>(socket);
+}
+
+async function waitForChatIdle(
+  workspace: RpcStub<Overseer>,
+  chatId: number,
+): Promise<AiChatMetadata> {
+  return bounded((async () => {
+    for (;;) {
+      const chat = (await workspace.listChats()).find((candidate) => candidate.id === chatId);
+      if (chat && !chat.activeAgent) return chat;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  })(), "workspace Codex turn", 8_000);
 }
 
 async function createAuthenticated(
@@ -133,7 +164,7 @@ describe("backend to private Codex sidecar lifecycle", () => {
     await reset();
   });
 
-  it("gates management, shares models, streams through one refresh, cancels, and disconnects", async () => {
+  it("covers shared login, streams, workspace billing bypass, cancellation, and disconnect", async () => {
     using publicApi = await connect();
     using admin = await createAuthenticated(publicApi, "codexadmin");
     using user = await createAuthenticated(publicApi, "codexuser");
@@ -217,6 +248,64 @@ describe("backend to private Codex sidecar lifecycle", () => {
     expect(await testEnv.CODEX_RELAY.readRequestSignalAborted()).toBe(false);
     expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(1);
 
+    // Exhaust the ordinary platform quota before taking the real authenticated workspace path.
+    // A non-Codex model would be rejected by checkUsageAndBalance() before inference, so the
+    // successful turn below dynamically proves that shared Codex bypasses that billing gate.
+    const quotaUser = runtimeExports.UserDurableObject.getByName("codexuser");
+    expect(await quotaUser.consumeDailyLlmCall(1)).toMatchObject({
+      withinLimits: true,
+      remaining: 0,
+      limit: 1,
+      used: 1,
+    });
+    expect(await user.getCloudflareUsage()).toMatchObject({
+      cloudflareLimitsEnabled: true,
+      unlimited: false,
+      dailyUsed: 1,
+      dailyLimit: 1,
+      remaining: 0,
+    });
+
+    await testEnv.CODEX_UPSTREAM.setStreamMode("complete");
+    const workspaceInferenceStart = (await testEnv.CODEX_UPSTREAM.read()).inferenceCalls;
+    const historicalModelId = codexProfileId("gpt-5.6-sol");
+    using workspace = await user.newGadget();
+    const chatId = await workspace.newChat(
+      "Exercise the authenticated workspace Codex path",
+      historicalModelId,
+    );
+    // The primary Sol turn and catalog-pinned Luna title turn both traverse the relay.
+    await bounded(
+      testEnv.CODEX_UPSTREAM.waitForInferenceCalls(workspaceInferenceStart + 2),
+      "workspace and quick-model inference",
+    );
+    const completedChat = await waitForChatIdle(workspace, chatId);
+    expect(completedChat.totalCost).toBeNull();
+    expect((await workspace.getMetadata()).totalCost).toBeNull();
+
+    const history = await workspace.getChatHistory(chatId);
+    expect(history.messages).toContainEqual(expect.objectContaining({
+      author: expect.objectContaining({ type: "agent", id: historicalModelId }),
+      type: "message",
+      message: "Cross-package hello",
+    }));
+    const workspaceUpstream = await testEnv.CODEX_UPSTREAM.read();
+    expect(workspaceUpstream.inferenceCalls).toBeGreaterThan(workspaceInferenceStart);
+    const workspaceBodies = workspaceUpstream.inferenceBodies.slice(workspaceInferenceStart);
+    expect(workspaceBodies.some((body) =>
+      JSON.stringify(body).includes("Exercise the authenticated workspace Codex path")
+    )).toBe(true);
+    expect(JSON.stringify(workspaceBodies)).not.toMatch(
+      /platform-(?:gateway|account|token)-must-not-cross|user-gateway-(?:account|token)-must-not-cross/,
+    );
+    expect(workspaceUpstream.lastInferenceHeaders["cf-aig-metadata"]).toBeUndefined();
+    expect(workspaceUpstream.lastInferenceHeaders["cf-aig-authorization"]).toBeUndefined();
+    expect(JSON.stringify(workspaceUpstream.lastInferenceHeaders)).not.toMatch(
+      /platform-(?:gateway|account|token)-must-not-cross|user-gateway-(?:account|token)-must-not-cross/,
+    );
+    // Codex did not merely sneak through an exhausted check: the ordinary quota was untouched.
+    expect(await user.getCloudflareUsage()).toMatchObject({ dailyUsed: 1, remaining: 0 });
+
     await adminApi.disconnectCodex();
     expect((await adminApi.getCodexConnectionStatus()).state).toBe("disconnected");
     expectCodexModels(await admin.listModels(), false);
@@ -226,6 +315,15 @@ describe("backend to private Codex sidecar lifecycle", () => {
     const unavailable = await run(handle, "Old handle must not silently fall back");
     expect(unavailable.stopReason).toBe("error");
     expect(unavailable.errorMessage).toMatch(/authentication|disconnected|unavailable/i);
+    expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(beforeUnavailable);
+
+    await expect(workspace.sendChatMessage(
+      chatId,
+      "This historical chat must require reconnect",
+      historicalModelId,
+    )).rejects.toThrow(
+      "The shared Codex connection is unavailable. Ask a deployment administrator to reconnect it.",
+    );
     expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(beforeUnavailable);
   });
 });
