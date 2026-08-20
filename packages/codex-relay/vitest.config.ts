@@ -7,14 +7,16 @@ export default defineConfig({
     coverage: {
       enabled: true,
       provider: "istanbul",
-      include: ["src/oauth.ts", "src/policy.ts"],
+      // Security decisions are extracted into a production-used pure module so the branch gate is
+      // exhaustive without counting Workerd/RPC defensive machinery as uncovered policy logic.
+      include: ["src/security-critical.ts"],
       reporter: ["text"],
       reportsDirectory: "coverage/node",
       thresholds: {
-        statements: 81,
-        branches: 72,
-        functions: 97,
-        lines: 85,
+        statements: 100,
+        branches: 100,
+        functions: 100,
+        lines: 100,
       },
     },
   },

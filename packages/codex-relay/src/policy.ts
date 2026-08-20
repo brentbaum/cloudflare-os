@@ -1,4 +1,9 @@
 import { zstdDecompressSync } from "node:zlib";
+import {
+  codexDownstreamHeaders,
+  codexUpstreamHeaders,
+  firstUnsupportedKey,
+} from "./security-critical.js";
 
 export const CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses";
 export const MAX_INFERENCE_BODY_BYTES = 10 * 1024 * 1024;
@@ -52,7 +57,7 @@ function rejectCapability(message: string): never {
 }
 
 function assertOnlyKeys(value: Record<string, unknown>, allowed: Set<string>, label: string): void {
-  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  const unknown = firstUnsupportedKey(value, allowed);
   if (unknown) rejectCapability(`${label} field ${unknown} is not enabled`);
 }
 
@@ -369,36 +374,15 @@ export function createUpstreamRequest(
   requestBody.set(body);
   return new Request(CODEX_UPSTREAM_URL, {
     method: "POST",
-    headers: {
-      Accept: "text/event-stream",
-      Authorization: `Bearer ${credential.accessToken}`,
-      "ChatGPT-Account-Id": credential.accountId,
-      "Content-Type": "application/json",
-      "OpenAI-Beta": "responses=experimental",
-      Originator: "pi",
-      Version: "0.144.1",
-    },
+    headers: codexUpstreamHeaders(credential),
     body: requestBody,
     signal,
   });
 }
 
-const RESPONSE_HEADERS = new Set([
-  "cache-control",
-  "content-type",
-  "openai-processing-ms",
-  "openai-version",
-  "request-id",
-  "retry-after",
-  "x-request-id",
-]);
-
 /** Return an upstream response without buffering its body and with a strict header allowlist. */
 export function sanitizeUpstreamResponse(response: Response): Response {
-  const headers = new Headers();
-  for (const [name, value] of response.headers) {
-    if (RESPONSE_HEADERS.has(name.toLowerCase())) headers.append(name, value);
-  }
+  const headers = codexDownstreamHeaders(response.headers);
   const upstream = response.body?.getReader();
   let downstreamCancelled = false;
   let released = false;

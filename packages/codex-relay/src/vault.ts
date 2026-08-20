@@ -24,12 +24,15 @@ import {
   sanitizeUpstreamResponse,
   validateInferenceRequest,
 } from "./policy.js";
+import {
+  refreshFailureTransition,
+  refreshRetryRemaining,
+  terminalPollResult,
+} from "./security-critical.js";
 
 const STATE_KEY = "codex-auth-state";
 const STATE_VERSION = 1 as const;
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
-const MIN_REFRESH_RETRY_MS = 1_000;
-const MAX_REFRESH_RETRY_MS = 5 * 60 * 1000;
 
 type RelayEnv = {
   CODEX_WRAPPING_KEY_CURRENT: string;
@@ -182,13 +185,6 @@ function authErrorResponse(error: unknown): Response {
   return Response.json(
     { error: { code: "relay_unavailable", message: "Codex relay is temporarily unavailable" } },
     { status: 503 },
-  );
-}
-
-function boundedRefreshRetryMs(value: number | undefined): number {
-  return Math.min(
-    MAX_REFRESH_RETRY_MS,
-    Math.max(MIN_REFRESH_RETRY_MS, value ?? MIN_REFRESH_RETRY_MS),
   );
 }
 
@@ -358,7 +354,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       (state.state !== "pending" && state.state !== "starting") ||
       state.attemptId !== attemptId
     ) {
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
     const now = Date.now();
     if (now >= state.expiresAt) {
@@ -387,7 +383,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       );
     } catch {
       const current = await this.#readRawState();
-      if (!samePendingState(current, state)) return { state: "superseded" };
+      if (!samePendingState(current, state)) return terminalPollResult(false);
       await this.#writeState({
         version: STATE_VERSION,
         state: "credential-state-unknown",
@@ -398,7 +394,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     }
     const beforePoll = await this.#readRawState();
     if (beforePoll.state !== "pending" || beforePoll.attemptId !== attemptId) {
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
     const poll = await pollDeviceAuthorization(
       secret.deviceAuthId,
@@ -407,7 +403,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     );
     const current = await this.#readRawState();
     if (current.state !== "pending" || current.attemptId !== attemptId)
-      return { state: "superseded" };
+      return terminalPollResult(false);
 
     if (poll.state === "pending") {
       const nextPollAt = Math.max(
@@ -449,7 +445,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch (error) {
       const afterFailure = await this.#readRawState();
       if (!ownsExchange(afterFailure, exchangeMarker)) {
-        return { state: "superseded" };
+        return terminalPollResult(false);
       }
       if (error instanceof OAuthProtocolError && error.kind === "transient") {
         await this.#writeState(current);
@@ -463,11 +459,11 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       } catch {
         // The pre-dispatch marker is already terminal and prevents code replay.
       }
-      return { state: "failed", reconnectRequired: true };
+      return terminalPollResult(true);
     }
     const afterExchange = await this.#readRawState();
     if (!ownsExchange(afterExchange, exchangeMarker)) {
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
 
     let encrypted: EncryptedEnvelope;
@@ -481,13 +477,13 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         } catch {
           // The exchange marker remains terminal when its diagnostic refinement cannot commit.
         }
-        return { state: "failed", reconnectRequired: true };
+        return terminalPollResult(true);
       }
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
     const afterEncryption = await this.#readRawState();
     if (!ownsExchange(afterEncryption, exchangeMarker)) {
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
     const connectionEpoch = newId();
     try {
@@ -504,13 +500,13 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         const afterFailure = await this.#readRawState();
         if (ownsExchange(afterFailure, exchangeMarker)) {
           await this.#writeState({ ...exchangeMarker, reason: "credential_commit_failed" });
-          return { state: "failed", reconnectRequired: true };
+          return terminalPollResult(true);
         }
       } catch {
         // The durable pre-dispatch marker remains terminal even when this diagnostic write fails.
-        return { state: "failed", reconnectRequired: true };
+        return terminalPollResult(true);
       }
-      return { state: "superseded" };
+      return terminalPollResult(false);
     }
     return { state: "ready", connectionEpoch, expiresAt: credential.expiresAt };
   }
@@ -545,12 +541,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     if (!forceRefresh && credential.expiresAt - Date.now() > REFRESH_MARGIN_MS) {
       return { credential, refreshed: false };
     }
-    if (
-      state.refreshRetry?.generation === state.generation &&
-      Date.now() < state.refreshRetry.notBefore
-    ) {
-      throw new AuthStateError("refresh_failed", state.refreshRetry.notBefore - Date.now());
-    }
+    const retryRemaining = refreshRetryRemaining(state.refreshRetry, state.generation, Date.now());
+    if (retryRemaining !== undefined) throw new AuthStateError("refresh_failed", retryRemaining);
     if (this.#refreshPromise) return this.#refreshPromise;
 
     const promise = this.#performRefresh(state, credential);
@@ -588,32 +580,26 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch (error) {
       const current = await this.#readRawState();
       if (!ownsRefresh(current, state, marker)) throw new AuthStateError("disconnected");
-      if (error instanceof OAuthProtocolError && error.kind === "invalid-grant") {
+      const transition = refreshFailureTransition(
+        error instanceof OAuthProtocolError ? error.kind : "ambiguous",
+        error instanceof OAuthProtocolError ? error.retryAfterMs : undefined,
+        Date.now(),
+      );
+      if (transition.state === "reauth-required") {
         await this.#writeState({
           version: STATE_VERSION,
           state: "reauth-required",
           connectionEpoch: state.connectionEpoch,
-          reason: "invalid_grant",
+          reason: transition.reason,
         });
         throw new AuthStateError("reauth_required");
       }
-      if (error instanceof OAuthProtocolError && error.kind === "transient") {
-        const { refresh: _refresh, ...restored } = current;
-        const retryAfterMs = boundedRefreshRetryMs(error.retryAfterMs);
-        const retryNotBefore = Date.now() + retryAfterMs;
-        await this.#writeState({
-          ...restored,
-          refreshRetry: { generation: current.generation, notBefore: retryNotBefore },
-        });
-        throw new AuthStateError("refresh_failed", retryAfterMs);
-      }
+      const { refresh: _refresh, ...restored } = current;
       await this.#writeState({
-        version: STATE_VERSION,
-        state: "reauth-required",
-        connectionEpoch: state.connectionEpoch,
-        reason: "ambiguous_refresh",
+        ...restored,
+        refreshRetry: { generation: current.generation, notBefore: transition.notBefore },
       });
-      throw new AuthStateError("reauth_required");
+      throw new AuthStateError("refresh_failed", transition.retryAfterMs);
     }
 
     const current = await this.#readRawState();

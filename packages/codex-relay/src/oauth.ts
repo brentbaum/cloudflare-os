@@ -1,3 +1,5 @@
+import { classifyRefreshHttpFailure } from "./security-critical.js";
+
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_USERCODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -310,19 +312,24 @@ export async function refreshCodexCredential(
 
   if (!response.ok) {
     const body = await responseBody(response);
-    if (errorCode(body) === "invalid_grant") {
+    const failure = classifyRefreshHttpFailure(
+      response.status,
+      errorCode(body),
+      parseRetryAfterMs(response),
+    );
+    if (failure.kind === "invalid-grant") {
       throw new OAuthProtocolError(
         "invalid-grant",
         "Credential refresh requires login",
         response.status,
       );
     }
-    if (response.status === 429) {
+    if (failure.kind === "transient") {
       throw new OAuthProtocolError(
         "transient",
         "Credential refresh was rate limited",
         response.status,
-        parseRetryAfterMs(response),
+        failure.retryAfterMs,
       );
     }
     throw new OAuthProtocolError(

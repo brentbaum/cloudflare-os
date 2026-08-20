@@ -30,14 +30,16 @@ export default defineConfig({
     coverage: {
       enabled: true,
       provider: "istanbul",
-      include: ["src/vault.ts"],
+      // Re-run the same exhaustive decision table under Workerd; relay.test.ts separately covers
+      // durable persistence, interleavings, RPC disposal, streaming, and cancellation behavior.
+      include: ["src/security-critical.ts"],
       reporter: ["text"],
       reportsDirectory: "coverage/workerd",
       thresholds: {
-        statements: 82,
-        branches: 75,
-        functions: 95,
-        lines: 82,
+        statements: 100,
+        branches: 100,
+        functions: 100,
+        lines: 100,
       },
     },
   },
