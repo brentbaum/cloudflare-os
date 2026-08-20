@@ -21,7 +21,7 @@
 |---|---|---|
 | 0. Contract spine and dependency probes | complete | Shared relay types compile; Pi probe identifies only the external-auth gap; deployment boundary is explicit. |
 | 1A. OAuth, vault, refresh | in progress | Pure and Workerd tests cover every state and fail-closed refresh outcome. |
-| 1B. Pi transport seam | maker complete, checking | Existing bearer behavior passes; external auth streams over an injected fetch. |
+| 1B. Pi transport seam | patch checked; adapter test pending 1C | Existing bearer behavior passes; external auth streams over an injected fetch. |
 | 1C. AgentOS provider and UI | in progress | Namespaced models, admin connection UX, and API-key regressions pass. |
 | 1D. Worker, preview, release harness | in progress | Private binding, migration, fake upstream, and private/manual deployment tests pass. |
 | 2. Cross-lane integration | pending | Full fake-upstream login through disconnect passes with streaming and cancellation. |
@@ -47,6 +47,9 @@ Wave 1: implement the relay vault, Pi external-auth patch, AgentOS integration, 
 - Deployment probe proved that classifying the relay as a gatekeeper would expose it through router wiring. The relay has its own private role.
 - Added the explicit private Worker package/deployment boundary, fake-preview topology, local opt-in wiring, and controlled-canary/rollback runbook.
 - Wave 1B maker commit `4162788` patches only Pi's external authorization seam; independent checking is in progress.
+- Independent Wave 1B checker found no code defects and verified the pin, patch hash, source maps,
+  legacy behavior, external header removal, and post-header cancellation. T2 stays open until the
+  AgentOS lane commits the adapter-shaped Service Binding/cancellation regression.
 
 ## Open Questions
 
@@ -86,6 +89,7 @@ Wave 1: implement the relay vault, Pi external-auth patch, AgentOS integration, 
 | `node --test scripts/release/manifest-lib.test.ts` | pass | 5 tests; current hosted manifest remains stable and explicitly excludes private relay. |
 | preview `config` + `deploy --dry-run` with fake values | pass | 20 private/public Worker configs; four-tier order and no private hostnames. |
 | `pnpm lint` | pass | Existing warnings only; includes scripts typecheck and full workspace build. |
+| Wave 1B independent checker | pass with test gap | Focused 5/5, backend 337/337, Workerd 2 pass/4 existing skips, uncached build, offline frozen install. |
 
 ## Secret-Safety Ledger
 
