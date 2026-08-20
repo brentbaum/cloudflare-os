@@ -7,10 +7,10 @@ export default defineConfig({
     coverage: {
       enabled: true,
       provider: "istanbul",
-      // Security decisions are extracted into a production-used pure module so the branch gate is
-      // exhaustive without counting Workerd/RPC defensive machinery as uncovered policy logic.
-      include: ["src/security-critical.ts"],
-      reporter: ["text"],
+      // Pure provider parsing and request policy are exhaustive here; the durable vault is
+      // separately instrumented on the exact capnweb-validated source in the Workerd config.
+      include: ["src/oauth.ts", "src/policy.ts", "src/security-critical.ts"],
+      reporter: [["text", { skipFull: false }]],
       reportsDirectory: "coverage/node",
       thresholds: {
         statements: 100,

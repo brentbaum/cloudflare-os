@@ -6,6 +6,8 @@ export { CodexAuth, CodexRelay, default } from "../src/index.js";
 type StreamMode = "complete" | "cancellable" | "premature" | "sized" | "timed";
 type ExchangeMode = "success" | "malformed" | "server-error";
 type RefreshMode = "success" | "server-error" | "rate-limited";
+type DeviceStartMode = "success" | "server-error";
+type DevicePollMode = "authorized" | "denied" | "expired" | "pending" | "rate-limited";
 
 let initialExpiresIn = 3600;
 let exchangeCalls = 0;
@@ -28,6 +30,16 @@ let streamActivePulls = 0;
 let streamMaxActivePulls = 0;
 let firstByteTimestamps: number[] = [];
 let cancellationTimestamps: number[] = [];
+let deviceStartMode: DeviceStartMode = "success";
+let devicePollMode: DevicePollMode = "authorized";
+let deviceStartCalls = 0;
+let devicePollCalls = 0;
+let deviceStartGate: Promise<void> | undefined;
+let releaseDeviceStartGate: (() => void) | undefined;
+let devicePollGate: Promise<void> | undefined;
+let releaseDevicePollGate: (() => void) | undefined;
+let exchangeGate: Promise<void> | undefined;
+let releaseExchangeGate: (() => void) | undefined;
 
 function fakeJwt(accountId: string, generation: number): string {
   const payload = btoa(
@@ -54,6 +66,10 @@ export class TestUpstream extends WorkerEntrypoint {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/api/accounts/deviceauth/usercode") {
+      deviceStartCalls++;
+      await deviceStartGate;
+      if (deviceStartMode === "server-error")
+        return Response.json({ error: "device_start_server_error_fake" }, { status: 503 });
       return Response.json({
         device_auth_id: "device_auth_workerd_fake",
         user_code: "WORKERD-FAKE",
@@ -61,6 +77,19 @@ export class TestUpstream extends WorkerEntrypoint {
       });
     }
     if (url.pathname === "/api/accounts/deviceauth/token") {
+      devicePollCalls++;
+      await devicePollGate;
+      if (devicePollMode === "denied")
+        return Response.json({ error: "access_denied" }, { status: 403 });
+      if (devicePollMode === "expired")
+        return Response.json({ error: "expired_token" }, { status: 404 });
+      if (devicePollMode === "pending")
+        return Response.json({ error: "authorization_pending" }, { status: 403 });
+      if (devicePollMode === "rate-limited")
+        return Response.json({ error: "slow_down" }, {
+          status: 429,
+          headers: { "Retry-After": "2" },
+        });
       return Response.json({
         authorization_code: "authorization_code_workerd_fake",
         code_verifier: "code_verifier_workerd_fake",
@@ -81,6 +110,7 @@ export class TestUpstream extends WorkerEntrypoint {
         return Response.json(fakeCredential(refreshCalls + 1, 3600));
       }
       exchangeCalls++;
+      await exchangeGate;
       if (exchangeMode === "malformed") return Response.json({ access_token: "malformed_fake" });
       if (exchangeMode === "server-error")
         return Response.json({ error: "server_error_fake" }, { status: 503 });
@@ -186,6 +216,9 @@ export class TestUpstream extends WorkerEntrypoint {
 
   reset(): void {
     releaseRefreshGate?.();
+    releaseDeviceStartGate?.();
+    releaseDevicePollGate?.();
+    releaseExchangeGate?.();
     initialExpiresIn = 3600;
     exchangeCalls = 0;
     refreshCalls = 0;
@@ -207,6 +240,16 @@ export class TestUpstream extends WorkerEntrypoint {
     streamMaxActivePulls = 0;
     firstByteTimestamps = [];
     cancellationTimestamps = [];
+    deviceStartMode = "success";
+    devicePollMode = "authorized";
+    deviceStartCalls = 0;
+    devicePollCalls = 0;
+    deviceStartGate = undefined;
+    releaseDeviceStartGate = undefined;
+    devicePollGate = undefined;
+    releaseDevicePollGate = undefined;
+    exchangeGate = undefined;
+    releaseExchangeGate = undefined;
   }
 
   setInitialExpiresIn(seconds: number): void {
@@ -215,6 +258,44 @@ export class TestUpstream extends WorkerEntrypoint {
 
   setExchangeMode(mode: ExchangeMode): void {
     exchangeMode = mode;
+  }
+
+  setDeviceStartMode(mode: DeviceStartMode): void {
+    deviceStartMode = mode;
+  }
+
+  setDevicePollMode(mode: DevicePollMode): void {
+    devicePollMode = mode;
+  }
+
+  blockDeviceStart(): void {
+    deviceStartGate = new Promise((resolve) => { releaseDeviceStartGate = resolve });
+  }
+
+  releaseDeviceStart(): void {
+    releaseDeviceStartGate?.();
+    deviceStartGate = undefined;
+    releaseDeviceStartGate = undefined;
+  }
+
+  blockDevicePoll(): void {
+    devicePollGate = new Promise((resolve) => { releaseDevicePollGate = resolve });
+  }
+
+  releaseDevicePoll(): void {
+    releaseDevicePollGate?.();
+    devicePollGate = undefined;
+    releaseDevicePollGate = undefined;
+  }
+
+  blockExchange(): void {
+    exchangeGate = new Promise((resolve) => { releaseExchangeGate = resolve });
+  }
+
+  releaseExchange(): void {
+    releaseExchangeGate?.();
+    exchangeGate = undefined;
+    releaseExchangeGate = undefined;
   }
 
   setRefreshMode(mode: RefreshMode): void {
@@ -262,6 +343,21 @@ export class TestUpstream extends WorkerEntrypoint {
   async waitForRefreshCalls(count: number): Promise<void> {
     // eslint-disable-next-line no-unmodified-loop-condition -- fetch() updates module state.
     while (refreshCalls < count) await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  async waitForDeviceStartCalls(count: number): Promise<void> {
+    // eslint-disable-next-line no-unmodified-loop-condition -- fetch() updates module state.
+    while (deviceStartCalls < count) await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  async waitForDevicePollCalls(count: number): Promise<void> {
+    // eslint-disable-next-line no-unmodified-loop-condition -- fetch() updates module state.
+    while (devicePollCalls < count) await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  async waitForExchangeCalls(count: number): Promise<void> {
+    // eslint-disable-next-line no-unmodified-loop-condition -- fetch() updates module state.
+    while (exchangeCalls < count) await new Promise((resolve) => setTimeout(resolve, 1));
   }
 
   async waitForStreamCancellation(): Promise<void> {

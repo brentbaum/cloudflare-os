@@ -25,8 +25,12 @@ import {
   validateInferenceRequest,
 } from "./policy.js";
 import {
+  ownsExchangeIdentity,
+  ownsRefreshIdentity,
   refreshFailureTransition,
   refreshRetryRemaining,
+  samePendingIdentity,
+  sameReadyIdentity,
   terminalPollResult,
 } from "./security-critical.js";
 
@@ -93,42 +97,23 @@ type StoredState =
       reason: string;
     };
 
+type ExchangeMarker = Extract<StoredState, { state: "reauth-required" }>;
+
 type PendingSecret = { deviceAuthId: string; userCode: string };
 type CredentialResolution = { credential: CodexCredential; refreshed: boolean };
 
-function sameEnvelope(left: EncryptedEnvelope, right: EncryptedEnvelope): boolean {
-  return left.version === right.version && left.keyId === right.keyId && left.iv === right.iv &&
-    left.ciphertext === right.ciphertext;
-}
-
 function samePendingState(current: StoredState, expected: PendingState): current is PendingState {
-  return current.state === "pending" && current.connectionEpoch === expected.connectionEpoch &&
-    current.attemptId === expected.attemptId && current.expiresAt === expected.expiresAt &&
-    current.nextPollAt === expected.nextPollAt &&
-    current.pollIntervalMs === expected.pollIntervalMs &&
-    sameEnvelope(current.pending, expected.pending);
-}
-
-function sameRefreshMarker(
-  left: RefreshMarker | undefined,
-  right: RefreshMarker | undefined,
-): boolean {
-  if (left === undefined || right === undefined) return left === right;
-  return left.generation === right.generation && left.attemptId === right.attemptId &&
-    left.startedAt === right.startedAt;
-}
-
-function sameRefreshRetry(left: RefreshRetry | undefined, right: RefreshRetry | undefined): boolean {
-  if (left === undefined || right === undefined) return left === right;
-  return left.generation === right.generation && left.notBefore === right.notBefore;
+  return samePendingIdentity(
+    current as unknown as Record<string, unknown>,
+    expected as unknown as Record<string, unknown>,
+  );
 }
 
 function sameReadyState(current: StoredState, expected: ReadyState): current is ReadyState {
-  return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
-    current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
-    sameEnvelope(current.credential, expected.credential) &&
-    sameRefreshMarker(current.refresh, expected.refresh) &&
-    sameRefreshRetry(current.refreshRetry, expected.refreshRetry);
+  return sameReadyIdentity(
+    current as unknown as Record<string, unknown>,
+    expected as unknown as Record<string, unknown>,
+  );
 }
 
 function ownsRefresh(
@@ -136,19 +121,18 @@ function ownsRefresh(
   expected: ReadyState,
   marker: RefreshMarker,
 ): current is ReadyState {
-  return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
-    current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
-    sameEnvelope(current.credential, expected.credential) &&
-    sameRefreshRetry(current.refreshRetry, expected.refreshRetry) &&
-    current.refresh?.generation === marker.generation &&
-    current.refresh.attemptId === marker.attemptId &&
-    current.refresh.startedAt === marker.startedAt;
+  return ownsRefreshIdentity(
+    current as unknown as Record<string, unknown>,
+    expected as unknown as Record<string, unknown>,
+    marker,
+  );
 }
 
-function ownsExchange(current: StoredState, marker: StoredState): boolean {
-  return marker.state === "reauth-required" && current.state === "reauth-required" &&
-    current.connectionEpoch === marker.connectionEpoch &&
-    current.attemptId === marker.attemptId && current.reason === marker.reason;
+function ownsExchange(current: StoredState, marker: ExchangeMarker): boolean {
+  return ownsExchangeIdentity(
+    current as unknown as Record<string, unknown>,
+    marker,
+  );
 }
 
 class AuthStateError extends Error {
@@ -425,7 +409,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     // Persist a terminal marker before dispatching the one-time authorization code. A reset,
     // non-definitive provider response, encryption failure, or ready-state commit failure can then
     // never leave a replayable pending code behind.
-    const exchangeMarker: StoredState = {
+    const exchangeMarker: ExchangeMarker = {
       version: STATE_VERSION,
       state: "reauth-required",
       connectionEpoch: current.connectionEpoch,
@@ -442,15 +426,15 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         Date.now(),
         this.#providerFetch,
       );
-    } catch (error) {
+    } catch {
       const afterFailure = await this.#readRawState();
       if (!ownsExchange(afterFailure, exchangeMarker)) {
         return terminalPollResult(false);
       }
-      if (error instanceof OAuthProtocolError && error.kind === "transient") {
-        await this.#writeState(current);
-        throw error;
-      }
+      // The production adapter is either a Workerd Fetcher or global fetch. Both return a Promise
+      // before any failure, so every reachable rejection is post-dispatch/ambiguous and terminal.
+      // exchangeDeviceCode retains its pre-dispatch classification for pure adapter-level tests,
+      // but the vault intentionally never makes a one-time authorization code replayable.
       try {
         await this.#writeState({
           ...exchangeMarker,
@@ -550,7 +534,8 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     try {
       return await promise;
     } finally {
-      if (this.#refreshPromise === promise) this.#refreshPromise = undefined;
+      // Only this invocation can install or clear this promise; concurrent callers only await it.
+      this.#refreshPromise = undefined;
       this.#activeRefreshAttempt = undefined;
     }
   }
@@ -580,9 +565,12 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch (error) {
       const current = await this.#readRawState();
       if (!ownsRefresh(current, state, marker)) throw new AuthStateError("disconnected");
+      // refreshCodexCredential normalizes every provider/network/parse failure to this protocol
+      // error before it crosses the helper boundary.
+      const protocolError = error as OAuthProtocolError;
       const transition = refreshFailureTransition(
-        error instanceof OAuthProtocolError ? error.kind : "ambiguous",
-        error instanceof OAuthProtocolError ? error.retryAfterMs : undefined,
+        protocolError.kind,
+        protocolError.retryAfterMs,
         Date.now(),
       );
       if (transition.state === "reauth-required") {

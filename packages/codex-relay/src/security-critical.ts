@@ -13,6 +13,84 @@ export type RefreshFailureTransition =
   | { state: "reauth-required"; reason: "ambiguous_refresh" | "invalid_grant" }
   | { state: "retry"; notBefore: number; retryAfterMs: number };
 
+type EnvelopeIdentity = { version: number; keyId: string; iv: string; ciphertext: string };
+type RefreshIdentity = { generation: number; attemptId: string; startedAt: number };
+
+function fieldValues(value: unknown, fields: readonly string[]): unknown[] {
+  const record = Object(value) as Record<string, unknown>;
+  return fields.map((field) => record[field]);
+}
+
+function envelopeValues(value: unknown): unknown[] {
+  return fieldValues(value, ["version", "keyId", "iv", "ciphertext"]);
+}
+
+/** Compare encrypted envelopes without ever decrypting or logging their contents. */
+export function sameEnvelopeIdentity(left: EnvelopeIdentity, right: EnvelopeIdentity): boolean {
+  return JSON.stringify([left.version, left.keyId, left.iv, left.ciphertext]) ===
+    JSON.stringify([right.version, right.keyId, right.iv, right.ciphertext]);
+}
+
+/** Compare the exact pending state that an asynchronous poll operation reserved. */
+export function samePendingIdentity(
+  current: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  const identity = (value: Record<string, unknown>) => [
+    ...fieldValues(value, [
+      "state",
+      "connectionEpoch",
+      "attemptId",
+      "expiresAt",
+      "nextPollAt",
+      "pollIntervalMs",
+    ]),
+    envelopeValues(value.pending),
+  ];
+  return JSON.stringify(identity(current)) === JSON.stringify(identity(expected));
+}
+
+/** Compare the exact ready generation an asynchronous credential operation observed. */
+export function sameReadyIdentity(
+  current: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  const identity = (value: Record<string, unknown>) => [
+    ...fieldValues(value, ["state", "connectionEpoch", "expiresAt", "generation"]),
+    envelopeValues(value.credential),
+    fieldValues(value.refresh, ["generation", "attemptId", "startedAt"]),
+    fieldValues(value.refreshRetry, ["generation", "notBefore"]),
+  ];
+  return JSON.stringify(identity(current)) === JSON.stringify(identity(expected));
+}
+
+/** Verify that a stored ready state still owns the exact in-progress refresh marker. */
+export function ownsRefreshIdentity(
+  current: Record<string, unknown>,
+  expected: Record<string, unknown>,
+  marker: RefreshIdentity,
+): boolean {
+  return sameReadyIdentity(current, { ...expected, refresh: marker });
+}
+
+/** Verify that a stored terminal marker still belongs to the same login exchange. */
+export function ownsExchangeIdentity(
+  current: Record<string, unknown>,
+  marker: { connectionEpoch: string; attemptId?: string; reason: string },
+): boolean {
+  return JSON.stringify([
+    current.state,
+    current.connectionEpoch,
+    current.attemptId,
+    current.reason,
+  ]) === JSON.stringify([
+    "reauth-required",
+    marker.connectionEpoch,
+    marker.attemptId,
+    marker.reason,
+  ]);
+}
+
 /** Classify a non-successful rotating-token response without assuming the token is reusable. */
 export function classifyRefreshHttpFailure(
   status: number,

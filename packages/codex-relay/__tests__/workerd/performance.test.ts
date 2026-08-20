@@ -55,6 +55,7 @@ async function consumeTimedFirstByte(name: string): Promise<number> {
 }
 
 function percentile95(values: number[]): number {
+  // eslint-disable-next-line unicorn/no-array-sort -- package target predates Array#toSorted.
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? Infinity;
 }

@@ -8,7 +8,7 @@
     "build": "tsc",
     "clean": "rm -rf dist .wrangler",
     "deploy": "pnpm exec capnweb-validate build --out .wrangler/validate && wrangler deploy -c wrangler.private.jsonc",
-    "test:run": "vitest run && vitest run -c vitest.worker.config.ts",
+    "test:run": "vitest run && capnweb-validate build --out .wrangler/validate && vitest run -c vitest.worker.config.ts",
     "types:generate": "wrangler types -c wrangler.private.jsonc worker-configuration.d.ts",
     "types:check": "node scripts/check-worker-types.mjs"
   },

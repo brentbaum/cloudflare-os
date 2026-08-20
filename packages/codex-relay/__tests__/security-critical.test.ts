@@ -6,8 +6,13 @@ import {
   codexDownstreamHeaders,
   codexUpstreamHeaders,
   firstUnsupportedKey,
+  ownsExchangeIdentity,
+  ownsRefreshIdentity,
   refreshFailureTransition,
   refreshRetryRemaining,
+  sameEnvelopeIdentity,
+  samePendingIdentity,
+  sameReadyIdentity,
   terminalPollResult,
 } from "../src/security-critical.js";
 
@@ -23,6 +28,44 @@ describe("security-critical relay decisions", () => {
     expect(classifyRefreshHttpFailure(503, "server_error", undefined)).toEqual({
       kind: "ambiguous",
     });
+  });
+
+  it("compares exact asynchronous state ownership identities", () => {
+    const envelope = { version: 1, keyId: "current", iv: "iv_fake", ciphertext: "cipher_fake" };
+    expect(sameEnvelopeIdentity(envelope, { ...envelope })).toBe(true);
+    expect(sameEnvelopeIdentity(envelope, { ...envelope, ciphertext: "other_fake" })).toBe(false);
+    const pending = {
+      state: "pending",
+      connectionEpoch: "epoch_fake",
+      attemptId: "attempt_fake",
+      expiresAt: 10,
+      nextPollAt: 5,
+      pollIntervalMs: 2,
+      pending: envelope,
+    };
+    expect(samePendingIdentity(pending, { ...pending })).toBe(true);
+    expect(samePendingIdentity(pending, { ...pending, attemptId: "other_fake" })).toBe(false);
+    const ready = {
+      state: "ready",
+      connectionEpoch: "epoch_fake",
+      expiresAt: 10,
+      generation: 1,
+      credential: envelope,
+      refreshRetry: { generation: 1, notBefore: 20 },
+    };
+    expect(sameReadyIdentity(ready, { ...ready })).toBe(true);
+    expect(sameReadyIdentity(ready, { ...ready, generation: 2 })).toBe(false);
+    const marker = { generation: 1, attemptId: "refresh_fake", startedAt: 5 };
+    expect(ownsRefreshIdentity({ ...ready, refresh: marker }, ready, marker)).toBe(true);
+    expect(ownsRefreshIdentity({ ...ready, refresh: { ...marker, startedAt: 6 } }, ready, marker))
+      .toBe(false);
+    const exchange = {
+      connectionEpoch: "epoch_fake",
+      attemptId: "attempt_fake",
+      reason: "authorization_code_exchange_in_progress",
+    };
+    expect(ownsExchangeIdentity({ state: "reauth-required", ...exchange }, exchange)).toBe(true);
+    expect(ownsExchangeIdentity({ state: "disconnected", ...exchange }, exchange)).toBe(false);
   });
 
   it("exhaustively maps refresh failures to durable transitions and bounded retry times", () => {

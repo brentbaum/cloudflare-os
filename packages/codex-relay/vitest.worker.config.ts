@@ -1,13 +1,13 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
-import capnwebValidate from "capnweb-validate/vite";
 import { kCurrentWorker } from "miniflare";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
-    capnwebValidate(),
     cloudflareTest({
-      main: "./__tests__/worker.ts",
+      // `test:run` prebuilds this entrypoint so coverage instruments the exact validated source
+      // Workerd executes instead of relying on the decorator transform's lossy source-map remap.
+      main: "./.wrangler/validate/__tests__/worker.ts",
       miniflare: {
         compatibilityDate: "2026-02-02",
         compatibilityFlags: ["nodejs_compat", "enable_request_signal", "enable_abortsignal_rpc"],
@@ -30,10 +30,11 @@ export default defineConfig({
     coverage: {
       enabled: true,
       provider: "istanbul",
-      // Re-run the same exhaustive decision table under Workerd; relay.test.ts separately covers
-      // durable persistence, interleavings, RPC disposal, streaming, and cancellation behavior.
-      include: ["src/security-critical.ts"],
-      reporter: ["text"],
+      include: [
+        ".wrangler/validate/src/security-critical.ts",
+        ".wrangler/validate/src/vault.ts",
+      ],
+      reporter: [["text", { skipFull: false }]],
       reportsDirectory: "coverage/workerd",
       thresholds: {
         statements: 100,
