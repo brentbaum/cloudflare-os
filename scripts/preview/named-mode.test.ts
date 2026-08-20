@@ -154,6 +154,10 @@ fs.appendFileSync(process.env.FAKE_COMMAND_LOG,
 if (process.argv[2] === "auth" && process.argv[3] === "token") {
   process.stdout.write(JSON.stringify({ type: "oauth", token: ${JSON.stringify(FAKE_OAUTH_TOKEN)} }));
 }
+if (process.argv[2] === "kv" && process.argv[3] === "namespace" && process.argv[4] === "delete") {
+  process.stderr.write('No KV namespace named "already-deleted" was found in your account.');
+  process.exit(1);
+}
 `);
   chmodSync(fake, 0o755);
   writeFileSync(loader, `

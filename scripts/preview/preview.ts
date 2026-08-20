@@ -940,7 +940,8 @@ async function cleanupNamedResources(
       const result = await runWrangler(commandWorker, wranglerCommand, args);
       writeCommandOutput(commandWorker, result);
       if (result.status === 0) continue;
-      if (/not found|does not exist|10006|10007/i.test(`${result.stdout}\n${result.stderr}`)) {
+      if (/not found|does not exist|No KV namespace named|10006|10007/i.test(
+          `${result.stdout}\n${result.stderr}`)) {
         console.warn(`Named ${resource.kind} resource ${resource.name} did not exist; continuing.`);
         continue;
       }
