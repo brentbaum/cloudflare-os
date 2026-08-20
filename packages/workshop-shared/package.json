@@ -27,6 +27,10 @@
       "types": "./src/external-message-gateway.ts",
       "import": "./src/external-message-gateway.ts"
     },
+    "./codex-relay": {
+      "types": "./src/codex-relay.ts",
+      "import": "./src/codex-relay.ts"
+    },
     "./theme": {
       "types": "./src/theme.ts",
       "import": "./src/theme.ts"
