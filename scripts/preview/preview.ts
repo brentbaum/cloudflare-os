@@ -9,12 +9,13 @@
 //   node scripts/preview/preview.ts sweep           tear down every abandoned preview
 //   ... --dry-run                                    print the plan, touch no network
 //
-// Deployment runs in three tiers, because each tier's service bindings must name the previews the
+// Deployment runs in four tiers, because each tier's service bindings must name the previews the
 // tier before it produced:
 //
-//   1. the 16 gatekeepers  (concurrently; nothing binds to anything)
-//   2. workshop-backend    (binds every gatekeeper preview via GatekeeperVendor)
-//   3. router              (binds the backend preview and every gatekeeper preview, and owns the
+//   1. the 16 gatekeepers and fake Codex upstream (concurrently; no cross-bindings)
+//   2. codex-relay         (binds only the fake Codex upstream)
+//   3. workshop-backend    (binds every gatekeeper preview and the private Codex relay)
+//   4. router              (binds the backend preview and every gatekeeper preview, and owns the
 //                           public origin: it serves the frontend and proxies /api and
 //                           /gatekeeper/<short>)
 //
@@ -22,8 +23,8 @@
 // previous tier returned. Everything else — every URL in the config — is derived up front from
 // the router's preview name, which is deterministic, so the tiers only have to exchange ids.
 //
-// The router is the only one of the eighteen with a hostname. Preview URLs are public, so the
-// other seventeen set `preview_urls: false` and are reached over service bindings alone; the
+// The router is the only one of the twenty with a hostname. Preview URLs are public, so the
+// other nineteen set `preview_urls: false` and are reached over service bindings alone; the
 // deploy asserts that, since a URL appearing on one of them is a way around the router.
 //
 // The backend's secrets — its admins and the Cloudflare Access application that authenticates the
@@ -363,7 +364,7 @@ async function uploadPreviewSecrets(
   if (result.status !== 0 && isMissingWorkerError(`${result.stdout}\n${result.stderr}`)) {
     await deployBaselineWorker(worker, wranglerCommand);
     // The baseline is briefly live without these, but it is only reachable through the *baseline*
-    // router — which is deployed after it, in tier 3, on the same first run.
+    // router — which is deployed after it, later in the same first run.
     const baseline = await uploadSecrets(worker, wranglerCommand, secrets, { previews: false });
     if (baseline.status !== 0) {
       throw new Error(`wrangler secret bulk failed for baseline worker ${worker.name} with exit ` +
@@ -406,7 +407,7 @@ async function deployPreview(
 
   const data = parseWranglerJson(result.stdout);
   // The id is what a sibling preview binds to, so it is required of every worker. A URL is not:
-  // only the router sets `preview_urls`, and the other seventeen are reached over service
+  // only the router sets `preview_urls`, and the other nineteen are reached over service
   // bindings alone.
   if (!data.preview?.id) throw new Error(`Wrangler did not emit a preview id for ${pkg.name}`);
   return {
@@ -578,7 +579,7 @@ function tiers(packages: readonly DeployablePackage[]): {
 
 async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
   // First, before a single config is written: a missing CF_ACCESS_AUD/CF_ACCESS_ISS has to fail
-  // here rather than after eighteen previews are live with whatever auth they defaulted to.
+  // here rather than after twenty previews are live with whatever auth they defaulted to.
   const secrets = backendSecrets();
   const relaySecrets = codexRelaySecrets();
   const { previewName, workersDevHost, baseUrl, packages } = generatePreviewConfigs();

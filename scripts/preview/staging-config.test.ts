@@ -354,7 +354,7 @@ test("no generated config carries a secret's value anywhere", () => {
   // `unsafe.bindings` entry verbatim in its configuration warning, and GitHub's secret masking does
   // not save either: it replaces exact occurrences of a registered secret, and a reformatted or
   // truncated slice is not one. So no generated config may carry one at all — not in `vars`, not
-  // anywhere else, and not in any of the eighteen, since only the backend reads them.
+  // anywhere else, and not in any of the twenty, since only the backend reads them.
   // Every value that identifies this deployment — the two whose values are ordinary words are left
   // to the name check above. The bare email as well as its JSON form, so that seeding the admins as
   // anything other than the secret's exact encoding — a comma-joined var, say — is caught too.
