@@ -627,17 +627,24 @@ describe("Codex relay in Workerd", () => {
 
       const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
       expect(response.status).toBe(200);
-      expect((await testEnv.CODEX_UPSTREAM.read()).streamBytesProduced).toBeLessThanOrEqual(
-        chunkBytes,
-      );
+      const initialProduced = (await testEnv.CODEX_UPSTREAM.read()).streamBytesProduced;
+      expect(initialProduced).toBeLessThan(totalBytes);
+      expect(initialProduced).toBeLessThanOrEqual(chunkBytes);
       const reader = response.body?.getReader();
       if (!reader) throw new Error("Missing sized fake response body");
       let received = 0;
+      let nextBackpressureSample = chunkBytes;
+      let maxProducedMinusConsumed = initialProduced;
       while (received < totalBytes) {
         const chunk = await reader.read();
         expect(chunk.done).toBe(false);
         expect(chunk.value?.byteLength).toBeLessThanOrEqual(chunkBytes);
         received += chunk.value?.byteLength ?? 0;
+        if (received >= nextBackpressureSample) {
+          const produced = (await testEnv.CODEX_UPSTREAM.read()).streamBytesProduced;
+          maxProducedMinusConsumed = Math.max(maxProducedMinusConsumed, produced - received);
+          while (received >= nextBackpressureSample) nextBackpressureSample += chunkBytes;
+        }
       }
       await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
       expect(received).toBe(totalBytes);
@@ -646,6 +653,7 @@ describe("Codex relay in Workerd", () => {
         streamBytesProduced: totalBytes,
         streamMaxActivePulls: 1,
       });
+      expect(maxProducedMinusConsumed).toBeLessThanOrEqual(chunkBytes);
     },
     60_000,
   );

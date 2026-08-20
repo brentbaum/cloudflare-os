@@ -3,7 +3,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 
 export { CodexAuth, CodexRelay, default } from "../src/index.js";
 
-type StreamMode = "complete" | "cancellable" | "premature" | "sized";
+type StreamMode = "complete" | "cancellable" | "premature" | "sized" | "timed";
 type ExchangeMode = "success" | "malformed" | "server-error";
 type RefreshMode = "success" | "server-error" | "rate-limited";
 
@@ -26,6 +26,8 @@ let streamChunkBytes = 0;
 let streamBytesProduced = 0;
 let streamActivePulls = 0;
 let streamMaxActivePulls = 0;
+let firstByteTimestamps: number[] = [];
+let cancellationTimestamps: number[] = [];
 
 function fakeJwt(accountId: string, generation: number): string {
   const payload = btoa(
@@ -114,6 +116,16 @@ export class TestUpstream extends WorkerEntrypoint {
         });
         return new Response(stream, { headers: { "Content-Type": "application/octet-stream" } });
       }
+      if (streamMode === "timed") {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            firstByteTimestamps.push(Date.now());
+            controller.enqueue(new TextEncoder().encode("data: fake-timed-first-byte\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
+      }
       if (streamMode === "premature") {
         let first = true;
         const stream = new ReadableStream<Uint8Array>({
@@ -136,6 +148,7 @@ export class TestUpstream extends WorkerEntrypoint {
           if (cancellationObserved) return;
           cancellationObserved = true;
           streamCancellations++;
+          cancellationTimestamps.push(Date.now());
         };
         request.signal.addEventListener("abort", observeCancellation, { once: true });
         const stream = new ReadableStream<Uint8Array>({
@@ -192,6 +205,8 @@ export class TestUpstream extends WorkerEntrypoint {
     streamBytesProduced = 0;
     streamActivePulls = 0;
     streamMaxActivePulls = 0;
+    firstByteTimestamps = [];
+    cancellationTimestamps = [];
   }
 
   setInitialExpiresIn(seconds: number): void {
@@ -235,6 +250,11 @@ export class TestUpstream extends WorkerEntrypoint {
     streamMaxActivePulls = 0;
   }
 
+  clearPerformanceSamples(): void {
+    firstByteTimestamps = [];
+    cancellationTimestamps = [];
+  }
+
   rejectNextInferenceAsUnauthorized(): void {
     unauthorizedOnce = true;
   }
@@ -247,6 +267,16 @@ export class TestUpstream extends WorkerEntrypoint {
   async waitForStreamCancellation(): Promise<void> {
     // eslint-disable-next-line no-unmodified-loop-condition -- stream cancellation updates module state.
     while (streamCancellations === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  readPerformanceSamples(): {
+    firstByteTimestamps: number[];
+    cancellationTimestamps: number[];
+  } {
+    return {
+      firstByteTimestamps: [...firstByteTimestamps],
+      cancellationTimestamps: [...cancellationTimestamps],
+    };
   }
 
   read(): {
