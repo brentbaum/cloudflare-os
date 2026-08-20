@@ -303,11 +303,12 @@ test("the backend's per-preview resources carry no ids, so wrangler provisions t
   }
 });
 
-test("the backend preview can propagate request cancellation through the Codex service binding", () => {
+test("the backend preview propagates cancellation through standard HTTP service-binding fetch", () => {
   const backend = buildAll().configs.get("workshop-backend");
   assert.ok(backend, "the backend preview config is missing");
   assert.ok(backend.compatibility_flags?.includes("enable_request_signal"));
-  assert.ok(backend.compatibility_flags?.includes("enable_abortsignal_rpc"));
+  assert.ok(!backend.compatibility_flags?.includes("enable_abortsignal_rpc"),
+      "HTTP service-binding inference must not enable AbortSignal RPC serialization");
 });
 
 test("no config names a resource belonging to another deployment", () => {
