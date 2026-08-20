@@ -21,7 +21,9 @@ type TestUpstreamControl = {
   waitForDeviceStartCalls(count: number): Promise<void>;
   waitForDevicePollCalls(count: number): Promise<void>;
   waitForExchangeCalls(count: number): Promise<void>;
-  setRefreshMode(mode: "success" | "server-error" | "rate-limited"): Promise<void>;
+  setRefreshMode(
+    mode: "success" | "server-error" | "rate-limited" | "erroring-body",
+  ): Promise<void>;
   blockRefresh(): Promise<void>;
   releaseRefresh(): Promise<void>;
   waitForRefreshCalls(count: number): Promise<void>;

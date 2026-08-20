@@ -5,7 +5,7 @@ export { CodexAuth, CodexRelay, default } from "../src/index.js";
 
 type StreamMode = "complete" | "cancellable" | "premature" | "sized" | "timed";
 type ExchangeMode = "success" | "malformed" | "server-error";
-type RefreshMode = "success" | "server-error" | "rate-limited";
+type RefreshMode = "success" | "server-error" | "rate-limited" | "erroring-body";
 type DeviceStartMode = "success" | "server-error";
 type DevicePollMode = "authorized" | "denied" | "expired" | "pending" | "rate-limited";
 
@@ -26,6 +26,8 @@ let refreshRetryAfterSeconds = 1;
 let streamTotalBytes = 0;
 let streamChunkBytes = 0;
 let streamBytesProduced = 0;
+let streamBytesProducedAtHeaders = 0;
+let streamProductionCompletedAt = 0;
 let streamActivePulls = 0;
 let streamMaxActivePulls = 0;
 let firstByteTimestamps: number[] = [];
@@ -107,6 +109,14 @@ export class TestUpstream extends WorkerEntrypoint {
             status: 429,
             headers: { "Retry-After": String(refreshRetryAfterSeconds) },
           });
+        if (refreshMode === "erroring-body") {
+          const body = new ReadableStream({
+            start(controller) {
+              controller.error(new Error("fake refresh response body failure"));
+            },
+          });
+          return new Response(body, { status: 429 });
+        }
         return Response.json(fakeCredential(refreshCalls + 1, 3600));
       }
       exchangeCalls++;
@@ -138,12 +148,16 @@ export class TestUpstream extends WorkerEntrypoint {
               const size = Math.min(streamChunkBytes, streamTotalBytes - streamBytesProduced);
               streamBytesProduced += size;
               controller.enqueue(new Uint8Array(size).fill(0x66));
-              if (streamBytesProduced >= streamTotalBytes) controller.close();
+              if (streamBytesProduced >= streamTotalBytes) {
+                streamProductionCompletedAt = Date.now();
+                controller.close();
+              }
             } finally {
               streamActivePulls--;
             }
           },
         });
+        streamBytesProducedAtHeaders = streamBytesProduced;
         return new Response(stream, { headers: { "Content-Type": "application/octet-stream" } });
       }
       if (streamMode === "timed") {
@@ -236,6 +250,8 @@ export class TestUpstream extends WorkerEntrypoint {
     streamTotalBytes = 0;
     streamChunkBytes = 0;
     streamBytesProduced = 0;
+    streamBytesProducedAtHeaders = 0;
+    streamProductionCompletedAt = 0;
     streamActivePulls = 0;
     streamMaxActivePulls = 0;
     firstByteTimestamps = [];
@@ -327,6 +343,8 @@ export class TestUpstream extends WorkerEntrypoint {
     streamTotalBytes = totalBytes;
     streamChunkBytes = chunkBytes;
     streamBytesProduced = 0;
+    streamBytesProducedAtHeaders = 0;
+    streamProductionCompletedAt = 0;
     streamActivePulls = 0;
     streamMaxActivePulls = 0;
   }
@@ -383,6 +401,8 @@ export class TestUpstream extends WorkerEntrypoint {
     lastInferenceHeaders: Record<string, string>;
     lastInferenceBody: string;
     streamBytesProduced: number;
+    streamBytesProducedAtHeaders: number;
+    streamProductionCompletedAt: number;
     streamChunkBytes: number;
     streamMaxActivePulls: number;
   } {
@@ -394,6 +414,8 @@ export class TestUpstream extends WorkerEntrypoint {
       lastInferenceHeaders,
       lastInferenceBody,
       streamBytesProduced,
+      streamBytesProducedAtHeaders,
+      streamProductionCompletedAt,
       streamChunkBytes,
       streamMaxActivePulls,
     };

@@ -565,12 +565,9 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch (error) {
       const current = await this.#readRawState();
       if (!ownsRefresh(current, state, marker)) throw new AuthStateError("disconnected");
-      // refreshCodexCredential normalizes every provider/network/parse failure to this protocol
-      // error before it crosses the helper boundary.
-      const protocolError = error as OAuthProtocolError;
       const transition = refreshFailureTransition(
-        protocolError.kind,
-        protocolError.retryAfterMs,
+        error instanceof OAuthProtocolError ? error.kind : "ambiguous",
+        error instanceof OAuthProtocolError ? error.retryAfterMs : undefined,
         Date.now(),
       );
       if (transition.state === "reauth-required") {
