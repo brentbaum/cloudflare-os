@@ -21,6 +21,10 @@
 //
 // Gatekeeper OAuth app credentials (CLIENT_ID/CLIENT_SECRET) are deliberately absent: previews
 // exercise routing, auth and the agent, not third-party connector flows.
+//
+// With PREVIEW_DEPLOY_MODE=named the same topology is deployed as uniquely named ordinary Workers
+// for accounts without Worker Previews. The router keeps its one stable workers.dev hostname, but
+// `preview_urls` stays false: a version-preview hostname would bypass the exact-hostname Access app.
 
 import { existsSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -532,6 +536,10 @@ export function buildPreviewConfigs({
       // A normal deploy reads top-level bindings, not `previews`. Give every ordinary service
       // binding the unique sibling Worker name up front, so no preview-id patching is involved.
       config.name = namedWorkerName(previewName, pkg.name);
+      // In named mode the router's stable workers.dev hostname is the single public origin.
+      // Version-preview URLs are additional public hostnames and are not covered by an Access app
+      // configured for that exact stable hostname, so they remain disabled even on the router.
+      config.preview_urls = false;
       config.observability = previewObservability(config);
       if (config.services) {
         const packageNames = new Set(packages.map(({ name }) => name));

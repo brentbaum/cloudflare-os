@@ -23,9 +23,10 @@
 // previous tier returned. Everything else — every URL in the config — is derived up front from
 // the router's preview name, which is deterministic, so the tiers only have to exchange ids.
 //
-// The router is the only one of the twenty with a hostname. Preview URLs are public, so the
-// other nineteen set `preview_urls: false` and are reached over service bindings alone; the
-// deploy asserts that, since a URL appearing on one of them is a way around the router.
+// The router is the only one of the twenty with a hostname. In Worker Preview mode that is its
+// preview URL. In named fallback mode it is the stable workers.dev hostname and even the router
+// sets `preview_urls: false`, because version-preview hostnames would bypass an exact-hostname
+// Access app. Every other Worker is reached over service bindings alone.
 //
 // The backend's secrets — its admins and the Cloudflare Access application that authenticates the
 // instance — are uploaded to the worker's Previews settings between tiers 1 and 2 and are never
@@ -689,6 +690,7 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
         "bound to every preview above");
     if (deployMode === "named") {
       console.log("  deploys ordinary Workers; service bindings use the unique sibling names");
+      console.log("  router uses its stable workers.dev hostname; version-preview URLs are off");
       console.log(`  secrets (${Object.keys({ ...secrets, ...relaySecrets }).join(", ")}) ` +
           "are sent only over wrangler secret bulk stdin");
     }

@@ -52,6 +52,7 @@ test("named deploy dry-run shows dependency tiers without invoking Wrangler or p
   assert.match(result.stdout, /tier 2: dry-run-only-codex-relay/);
   assert.match(result.stdout, /tier 3: dry-run-only-workshop-backend/);
   assert.match(result.stdout, /tier 4: dry-run-only-router/);
+  assert.match(result.stdout, /stable workers\.dev hostname; version-preview URLs are off/);
   assert.match(result.stdout, /sent only over wrangler secret bulk stdin/);
   for (const secret of [FAKE_ACCESS_AUD, FAKE_ACCESS_ISS, FAKE_ADMIN, FAKE_WRAPPING_KEY]) {
     assert.ok(!result.stdout.includes(secret), `dry-run printed secret value ${secret}`);

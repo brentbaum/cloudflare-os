@@ -233,7 +233,7 @@ test("the router is the only worker with a public hostname", () => {
   }
 });
 
-test("named fallback creates ordinary unique Workers and exposes only its router", () => {
+test("named fallback exposes only the router's stable workers.dev hostname", () => {
   const { packages, configs } = buildAll("named");
 
   for (const { name } of packages) {
@@ -242,7 +242,9 @@ test("named fallback creates ordinary unique Workers and exposes only its router
     assert.equal(config.name, namedWorkerName(PREVIEW_NAME, name));
     assert.equal(config.previews, undefined, `${name}: named config retains beta preview settings`);
     assert.equal(config.workers_dev, name === "router", `${name}: workers_dev`);
-    assert.equal(config.preview_urls, name === "router", `${name}: preview_urls`);
+    // Even the router must not get a version-preview hostname: the Access application protects the
+    // exact stable workers.dev hostname, not every versioned hostname Cloudflare might mint.
+    assert.equal(config.preview_urls, false, `${name}: preview_urls`);
   }
 });
 
