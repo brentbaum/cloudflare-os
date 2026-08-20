@@ -47,16 +47,20 @@ export default defineConfig({
     include: ["__tests__/codex-sidecar.integration.spec.ts"],
     setupFiles: ["../../scripts/assert-workerd.ts"],
     testTimeout: 30_000,
-    // vitest-pool reports the pending RPC body read's expected cancellation even though the
-    // cancellation is handled. This dedicated test still proves bounded upstream cancellation,
-    // exactly one body cancel, an un-aborted post-header request signal, and Pi's aborted result.
+    // vitest-pool independently reports the pending RPC read cancellation after Pi handles it.
+    // Production has no suppression. Keep this dedicated-suite exception pinned to Pi 0.83's
+    // parseSSE frame; its truthful dist source map presents the runtime JS frame as the TS source.
     onUnhandledError(error) {
-      return !(
-        typeof error === "object" &&
-        error !== null &&
-        "message" in error &&
-        error.message === "Stream was cancelled."
-      );
+      if (typeof error !== "object" || error === null) return true;
+      const message = "message" in error ? error.message : undefined;
+      const stack = "stack" in error ? error.stack : undefined;
+      const isPinnedPiParseSseCancellation =
+        message === "Stream was cancelled." &&
+        typeof stack === "string" &&
+        /at parseSSE \([^\n)]*\/@earendil-works\+pi-ai@0\.83\.0_patch_hash=[^/\n]+\/node_modules\/@earendil-works\/pi-ai\/src\/api\/openai-codex-responses\.ts:\d+:\d+\)/.test(
+          stack,
+        );
+      return !isPinnedPiParseSseCancellation;
     },
   },
 });
