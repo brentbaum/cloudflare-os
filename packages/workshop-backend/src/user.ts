@@ -97,6 +97,31 @@ export function resolveCodexQuickFallback(
   return resolveCodexModel(codexProfileId(CODEX_QUICK_MODEL_ID), status)?.config;
 }
 
+/** Preserve a historical shared-model ID so disconnect produces a reconnect error, not fallback. */
+export function selectExternalMessageModelId(
+  models: AiChatAuthorInfo[],
+  existingChatModelId: string | null,
+  preferredModelId: string | null,
+): string | null {
+  if (existingChatModelId && isCodexProfileId(existingChatModelId)) {
+    return existingChatModelId;
+  }
+  return models.find(model => model.id === existingChatModelId)?.id
+    ?? models.find(model => model.id === preferredModelId)?.id
+    ?? models[0]?.id
+    ?? null;
+}
+
+/** Resolve one shared model or throw the stable historical-chat recovery message. */
+export function requireCodexModel(profileId: string, status: CodexConnectionStatus) {
+  const model = resolveCodexModel(profileId, status);
+  if (!model) {
+    throw new Error(
+        "The shared Codex connection is unavailable. Ask a deployment administrator to reconnect it.");
+  }
+  return model;
+}
+
 type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
   created: Date,
@@ -773,11 +798,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     };
     if (modelId) {
       if (isCodexProfileId(modelId)) {
-        result.aiModel = resolveCodexModel(modelId, codexStatus!);
-        if (!result.aiModel) {
-          throw new Error(
-              "The shared Codex connection is unavailable. Ask a deployment administrator to reconnect it.");
-        }
+        result.aiModel = requireCodexModel(modelId, codexStatus!);
       }
       // In AI Gateway mode, resolve gateway models first.
       if (!result.aiModel && gwConfig) {
@@ -810,12 +831,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async getExternalMessageChatContext(existingChatModelId: string | null): Promise<UserChatContext> {
     let models = await this.listModels();
     const preferredModel = await this.getPreferredModel();
-    // Prefer the existing chat's model, then the user's preferred model, then the first available model.
-    let selectedModel = models.find(model => model.id === existingChatModelId)
-      ?? models.find(model => model.id === preferredModel)
-      ?? models[0];
-
-    return this.getChatContext(selectedModel?.id ?? null);
+    // A historical Codex ID is intentionally retained even when projection disappeared: resolving
+    // it below produces the actionable reconnect error instead of silently changing providers.
+    return this.getChatContext(
+        selectExternalMessageModelId(models, existingChatModelId, preferredModel));
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {
@@ -860,11 +879,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     await this.newGadget(id, title);
   }
 
-  async setGadgetLastActive(id: string, time: Date, totalCost: number | undefined): Promise<void> {
+  async setGadgetLastActive(
+      id: string, time: Date, totalCost: number | null | undefined): Promise<void> {
     let gadget = this.storage.gadgets.get(id);
     if (gadget) {
       gadget.lastActive = time;
-      if (totalCost) {
+      if (totalCost !== undefined) {
         gadget.totalCost = totalCost;
       }
       this.storage.gadgets.put(gadget);

@@ -341,7 +341,7 @@ export interface AgentHooks {
   addChatMessages(chatId: number, author: AiChatAuthorInfo,
       msgs: AiChatMessageBodyWithModelData[],
       totalTokens?: number, aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
-      estimatedCost?: number): void;
+      estimatedCost?: number, costUnknown?: boolean): void;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
 
   /**
@@ -3146,7 +3146,7 @@ export async function runAgent(
 
         hooks.addChatMessages(chatId, author, msgs, message.usage.totalTokens,
             handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute,
-            message.usage.cost.total);
+            message.usage.cost.total, handle.model.provider === "openai-codex");
 
         // Reset per-step streaming state.
         toolCallNotes.clear();

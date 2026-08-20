@@ -57,6 +57,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import * as Y from "yjs";
 import styles from "./ChatInterface.module.css";
+import { formatInferenceCost } from "./inferenceCost";
 import {
   getStoredSelectedModel,
   persistSelectedModel,
@@ -6783,11 +6784,11 @@ function ChatInterface({
                         <span className="flex-shrink-0">
                           {formatChatRowTime(chat.lastActive, bucket, chatListNow)}
                         </span>
-                        {chat.totalCost != null && (
+                        {chat.totalCost !== undefined && (
                           <>
                             <span className="flex-shrink-0" aria-hidden="true">·</span>
                             <span className="flex-shrink-0 font-mono">
-                              ${chat.totalCost.toFixed(4)}
+                              {formatInferenceCost(chat.totalCost)}
                             </span>
                           </>
                         )}
@@ -7911,8 +7912,8 @@ function ChatInterface({
                         {currentChatMetadata.totalTokens.toLocaleString()} tokens
                       </span>
                     )}
-                    {currentChatMetadata?.totalCost != null && (
-                      <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
+                    {currentChatMetadata?.totalCost !== undefined && (
+                      <span>{formatInferenceCost(currentChatMetadata.totalCost)}</span>
                     )}
                   </div>
                 </div>

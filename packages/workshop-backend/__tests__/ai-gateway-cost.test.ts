@@ -40,6 +40,8 @@ describe("AI Gateway cost persistence", () => {
             totalTokens?: number,
             logId?: string,
             route?: AiGatewayLogRoute,
+            estimatedCost?: number,
+            costUnknown?: boolean,
           ): void;
         };
       };
@@ -63,4 +65,52 @@ describe("AI Gateway cost persistence", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   }, 5000);
+
+  it("marks Codex-only and mixed-provider totals unknown instead of displaying zero", async () => {
+    const stub = env.TEST_OVERSEER.getByName("codex-unknown-cost");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      const overseer = instance as unknown as {
+        impl: {
+          storage: {
+            chatMeta: {
+              put(meta: AiChatMetadata): void;
+              get(id: number): AiChatMetadata | undefined;
+            };
+            totalCost: { get(): number | null };
+          };
+          addChatMessages(
+            chatId: number,
+            author: AiChatAuthorInfo,
+            messages: [],
+            totalTokens?: number,
+            logId?: string,
+            route?: AiGatewayLogRoute,
+            estimatedCost?: number,
+            costUnknown?: boolean,
+          ): void;
+        };
+      };
+      const meta = (id: number): AiChatMetadata => ({
+        id, title: "Chat", started: new Date(id), lastActive: new Date(id),
+      });
+      overseer.impl.storage.chatMeta.put(meta(7));
+      overseer.impl.storage.chatMeta.put(meta(8));
+
+      // Chat 7 first accrues a known direct-provider estimate, then uses the subscription.
+      overseer.impl.addChatMessages(7, AUTHOR, [], undefined, undefined, undefined, 1.25);
+      expect(overseer.impl.storage.chatMeta.get(7)?.totalCost).toBe(1.25);
+      overseer.impl.addChatMessages(7, AUTHOR, [], undefined, undefined, undefined, 0, true);
+
+      // Chat 8 is subscription-only. Both it and the mixed workspace are explicitly unknown.
+      overseer.impl.addChatMessages(8, AUTHOR, [], undefined, undefined, undefined, 0, true);
+      expect(overseer.impl.storage.chatMeta.get(7)?.totalCost).toBeNull();
+      expect(overseer.impl.storage.chatMeta.get(8)?.totalCost).toBeNull();
+      expect(overseer.impl.storage.totalCost.get()).toBeNull();
+
+      // Later priced calls cannot turn an incomplete mixed total back into a numeric subtotal.
+      overseer.impl.addChatMessages(7, AUTHOR, [], undefined, undefined, undefined, 2.5);
+      expect(overseer.impl.storage.chatMeta.get(7)?.totalCost).toBeNull();
+      expect(overseer.impl.storage.totalCost.get()).toBeNull();
+    });
+  });
 });

@@ -1276,8 +1276,8 @@ export type GadgetMetadata = {
    */
   title: string;
 
-  /** Total cost of AI inference in dollars, if known. */
-  totalCost?: number;
+  /** Total cost of AI inference in dollars; null means some inference has unknown monetary cost. */
+  totalCost?: number | null;
 
   /** Whether the user has pinned this gadget to the top of their list. */
   pinned?: boolean;
@@ -2154,8 +2154,8 @@ export type AiChatMetadata = {
    */
   totalTokens?: number;
 
-  /** Total cost of this conversation so far, in dollars, if known. */
-  totalCost?: number;
+  /** Total cost so far; null means this conversation includes inference with unknown cost. */
+  totalCost?: number | null;
 
   /**
    * First sequence this chat still replays. Everything before it is covered by a compaction

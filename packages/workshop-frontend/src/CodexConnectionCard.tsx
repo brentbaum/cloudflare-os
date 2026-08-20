@@ -30,24 +30,27 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollGeneration = useRef(0)
 
-  const clearPolling = useCallback(() => {
+  const invalidateLifecycle = useCallback(() => {
     pollGeneration.current += 1
     if (pollTimer.current !== null) clearTimeout(pollTimer.current)
     pollTimer.current = null
+    return pollGeneration.current
   }, [])
 
-  const refresh = useCallback(async () => {
-    if (!adminApi) return
-    const next = await adminApi.getCodexConnectionStatus()
-    setStatus(next)
-    return next
-  }, [adminApi])
-
-  const finishAttempt = useCallback(async (result: CodexDevicePollResult) => {
-    clearPolling()
+  const finishAttempt = useCallback(async (
+    api: RpcStub<AdminApi>,
+    result: CodexDevicePollResult,
+    generation: number,
+  ) => {
+    if (generation !== pollGeneration.current) return
+    if (pollTimer.current !== null) clearTimeout(pollTimer.current)
+    pollTimer.current = null
     setAttempt(null)
-    await refresh()
+    const nextStatus = await api.getCodexConnectionStatus()
+    if (generation !== pollGeneration.current) return
+    setStatus(nextStatus)
     await onConnectionChange()
+    if (generation !== pollGeneration.current) return
     if (result.state === 'ready') {
       toasts.add({ title: 'Codex subscription connected', variant: 'success' })
     } else if (result.state === 'denied') {
@@ -57,97 +60,126 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
     } else if (result.state === 'superseded') {
       toasts.add({ title: 'A newer Codex sign-in replaced this attempt', variant: 'error' })
     }
-  }, [clearPolling, onConnectionChange, refresh, toasts])
+  }, [onConnectionChange, toasts])
 
-  const schedulePoll = useCallback((attemptId: string, nextPollAt: number) => {
-    if (!adminApi) return
-    clearPolling()
-    const generation = pollGeneration.current
+  const schedulePoll = useCallback((
+    api: RpcStub<AdminApi>,
+    attemptId: string,
+    nextPollAt: number,
+    generation: number,
+  ) => {
+    if (generation !== pollGeneration.current) return
+    if (pollTimer.current !== null) clearTimeout(pollTimer.current)
     pollTimer.current = setTimeout(async () => {
       if (generation !== pollGeneration.current) return
       pollTimer.current = null
       try {
-        const result = await adminApi.pollCodexLogin(attemptId)
+        const result = await api.pollCodexLogin(attemptId)
         if (generation !== pollGeneration.current) return
         if (result.state === 'pending') {
           setAttempt((current) => current?.attemptId === attemptId
             ? { ...current, nextPollAt: result.nextPollAt, expiresAt: result.expiresAt }
             : current)
-          schedulePoll(attemptId, result.nextPollAt)
+          schedulePoll(api, attemptId, result.nextPollAt, generation)
         } else {
-          await finishAttempt(result)
+          await finishAttempt(api, result, generation)
+          if (generation !== pollGeneration.current) return
         }
       } catch (error) {
         if (generation !== pollGeneration.current) return
         console.error('Failed to poll Codex sign-in:', error)
-        clearPolling()
+        if (pollTimer.current !== null) clearTimeout(pollTimer.current)
+        pollTimer.current = null
         toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
-        await refresh().catch(() => {})
+        try {
+          const nextStatus = await api.getCodexConnectionStatus()
+          if (generation !== pollGeneration.current) return
+          setStatus(nextStatus)
+        } catch {
+          if (generation !== pollGeneration.current) return
+        }
       }
     }, Math.max(0, nextPollAt - Date.now()))
-  }, [adminApi, clearPolling, finishAttempt, refresh, toasts])
+  }, [finishAttempt, toasts])
 
   useEffect(() => {
+    const generation = invalidateLifecycle()
+    setStatus(null)
+    setAttempt(null)
+    setBusy(false)
     if (!adminApi) {
-      setStatus(null)
       return
     }
-    let cancelled = false
-    refresh().then((next) => {
-      if (!cancelled && next?.state === 'pending') {
-        schedulePoll(next.attemptId, next.nextPollAt)
-      }
-    }).catch((error) => {
-      if (!cancelled) {
+    const api = adminApi
+    ;(async () => {
+      try {
+        const next = await api.getCodexConnectionStatus()
+        if (generation !== pollGeneration.current) return
+        setStatus(next)
+        if (next.state === 'pending') {
+          schedulePoll(api, next.attemptId, next.nextPollAt, generation)
+        }
+      } catch (error) {
+        if (generation !== pollGeneration.current) return
         console.error('Failed to load Codex connection:', error)
         toasts.add({ title: 'Could not load Codex connection', variant: 'error' })
       }
-    })
+    })()
     return () => {
-      cancelled = true
-      clearPolling()
+      invalidateLifecycle()
     }
-  }, [adminApi, clearPolling, refresh, schedulePoll, toasts])
+  }, [adminApi, invalidateLifecycle, schedulePoll, toasts])
 
   const startLogin = async () => {
     if (!adminApi || busy) return
+    const api = adminApi
+    const generation = invalidateLifecycle()
     setBusy(true)
-    clearPolling()
     try {
-      const authorization = await adminApi.startCodexLogin()
+      const authorization = await api.startCodexLogin()
+      if (generation !== pollGeneration.current) return
       const pending = {
         ...authorization,
         nextPollAt: Date.now() + authorization.pollIntervalMs,
       }
       setAttempt(pending)
-      const nextStatus = await refresh()
-      schedulePoll(authorization.attemptId,
-        nextStatus?.state === 'pending' && nextStatus.attemptId === authorization.attemptId
+      const nextStatus = await api.getCodexConnectionStatus()
+      if (generation !== pollGeneration.current) return
+      setStatus(nextStatus)
+      schedulePoll(api, authorization.attemptId,
+        nextStatus.state === 'pending' && nextStatus.attemptId === authorization.attemptId
           ? nextStatus.nextPollAt
-          : pending.nextPollAt)
+          : pending.nextPollAt, generation)
     } catch (error) {
+      if (generation !== pollGeneration.current) return
       console.error('Failed to start Codex sign-in:', error)
       toasts.add({ title: 'Could not start Codex sign-in', variant: 'error' })
     } finally {
-      setBusy(false)
+      if (generation === pollGeneration.current) setBusy(false)
     }
   }
 
   const disconnect = async () => {
     if (!adminApi || busy || !confirm('Disconnect the shared Codex subscription for everyone?')) return
+    const api = adminApi
+    const generation = invalidateLifecycle()
     setBusy(true)
-    clearPolling()
     try {
-      await adminApi.disconnectCodex()
+      await api.disconnectCodex()
+      if (generation !== pollGeneration.current) return
       setAttempt(null)
-      await refresh()
+      const nextStatus = await api.getCodexConnectionStatus()
+      if (generation !== pollGeneration.current) return
+      setStatus(nextStatus)
       await onConnectionChange()
+      if (generation !== pollGeneration.current) return
       toasts.add({ title: 'Codex subscription disconnected', variant: 'success' })
     } catch (error) {
+      if (generation !== pollGeneration.current) return
       console.error('Failed to disconnect Codex:', error)
       toasts.add({ title: 'Could not disconnect Codex', variant: 'error' })
     } finally {
-      setBusy(false)
+      if (generation === pollGeneration.current) setBusy(false)
     }
   }
 

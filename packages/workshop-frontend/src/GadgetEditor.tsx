@@ -154,7 +154,8 @@ type WorkspaceView =
   | { mode: 'app'; appId?: WorkpieceId }
   | { mode: 'activity' }
 
-function formatHeaderCost(cost: number) {
+function formatHeaderCost(cost: number | null) {
+  if (cost === null) return 'unknown'
   if (cost === 0) return '$0'
   if (cost < 0.01) return '<$0.01'
   return `$${cost.toFixed(2)}`
@@ -1406,7 +1407,7 @@ export default function GadgetEditor() {
             currentUserId={userInfo?.id ?? null}
           />
 
-          {metadata.totalCost != null && (
+          {metadata.totalCost !== undefined && (
             <span className="ml-3 mr-2 text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
               {formatHeaderCost(metadata.totalCost)}
             </span>

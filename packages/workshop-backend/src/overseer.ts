@@ -808,7 +808,7 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       ownerRegistrationPending: false,
 
       codeVersion: 0,
-      totalCost: 0,
+      totalCost: <number | null>0,
 
       // Next workpiece ID. This is called `nextGatekeeperId` for historical reasons (it predates
       // the ability to have multiple gadgets per workspace), but it is actually used to allocate
@@ -5436,7 +5436,8 @@ class OverseerImpl implements AgentHooks {
   addChatMessages(chatId: number, author: AiChatAuthorInfo,
         msgs: AiChatMessageBodyWithModelData[],
         totalTokens?: number, aiGatewayLogId?: string,
-        aiGatewayLogRoute?: AiGatewayLogRoute, estimatedCost?: number): void {
+        aiGatewayLogRoute?: AiGatewayLogRoute, estimatedCost?: number,
+        costUnknown = false): void {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) {
       // Chat thread deleted?
@@ -5496,7 +5497,15 @@ class OverseerImpl implements AgentHooks {
     }
 
     meta.lastActive = this.getChatTimestamp();
+    if (costUnknown) meta.totalCost = null;
     this.storage.chatMeta.put(meta);
+
+    if (costUnknown) {
+      // A numeric subtotal would be misleading for both Codex-only and mixed-provider workspaces.
+      // Null is durable and contagious: later priced calls cannot make an incomplete sum known.
+      this.storage.totalCost.put(null);
+      return;
+    }
 
     if (aiGatewayLogId && aiGatewayLogRoute) {
       // Best-effort UI accounting only. The log ID is not persisted, so a DO restart can lose
@@ -5522,14 +5531,15 @@ class OverseerImpl implements AgentHooks {
       return;
     }
 
-    meta.totalCost = (meta.totalCost ?? 0) + cost;
+    if (meta.totalCost !== null) meta.totalCost = (meta.totalCost ?? 0) + cost;
 
     // Even though this is not really activity, we need to update lastActive for the subscription
     // machinery to work correctly.
     meta.lastActive = this.getChatTimestamp();
 
     this.storage.chatMeta.put(meta);
-    this.storage.totalCost.put(this.storage.totalCost.get() + cost);
+    let workspaceCost = this.storage.totalCost.get();
+    if (workspaceCost !== null) this.storage.totalCost.put(workspaceCost + cost);
   }
 
   // Fetches an AI Gateway log entry and adds the cost to the given chat ID's cost indicator.
@@ -7479,7 +7489,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     };
     let costSubscriber = {
-      update(value: number | undefined) {
+      update(value: number | null | undefined) {
         metadata.totalCost = value;
         callback(metadata).catch(unsubscribe);
       }

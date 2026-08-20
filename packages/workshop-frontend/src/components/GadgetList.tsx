@@ -10,6 +10,7 @@ import { BindingBadge, getGradient as getBlueprintGradient, uniqueBindingBadges 
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { BlueprintPreviewImage } from './BlueprintPreviewImage'
 import DeleteConfirmationDialog from './DeleteConfirmationDialog'
+import { formatInferenceCost } from '../inferenceCost'
 
 // Neutral monogram for a workspace — matches the sidebar treatment (no per-item color noise).
 function initials(title: string | undefined): string {
@@ -28,10 +29,6 @@ function formatRelativeTime(date: Date): string {
   if (hours < 24) return `${hours}h ago`
   const days = Math.floor(hours / 24)
   return `${days}d ago`
-}
-
-function formatCost(cost: number): string {
-  return `$${cost.toFixed(4)}`
 }
 
 function AppRow({
@@ -434,7 +431,7 @@ export default function GadgetList({ showHeader = true }: { showHeader?: boolean
             <div className="flex justify-between">
               <span className="text-kumo-subtle">Total cost</span>
               <span className="text-kumo-default">
-                {formatCost(infoTarget?.totalCost ?? 0)}
+                {formatInferenceCost(infoTarget?.totalCost === undefined ? 0 : infoTarget.totalCost)}
               </span>
             </div>
             <div className="flex justify-between">

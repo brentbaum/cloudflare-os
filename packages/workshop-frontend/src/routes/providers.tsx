@@ -1,12 +1,10 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { RpcStub } from 'capnweb'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  AdminApi,
   ApiKeyModelProvider,
   SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
@@ -21,13 +19,18 @@ import AddModelModal from '../AddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 import CodexConnectionCard from '../CodexConnectionCard'
+import {
+  isSharedCodexModel,
+  providerModelManagement,
+  SharedCodexNotice,
+  useCodexAdminCapability,
+} from '../CodexProviderPolicy'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
 const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as ApiKeyModelProvider[]
-const CODEX_MODEL_PREFIX = 'openai-codex/'
 
 const PRIMARY_BTN =
   'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
@@ -147,7 +150,7 @@ function ProvidersPage() {
   const [loadError, setLoadError] = useState(false)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
-  const [admin, setAdmin] = useState<{ api: RpcStub<AdminApi> } | null>(null)
+  const adminApi = useCodexAdminCapability(authenticatedApi, isAdmin)
 
   const fetchAll = useCallback(async () => {
     setLoadError(false)
@@ -170,33 +173,6 @@ function ProvidersPage() {
 
   useEffect(() => { fetchAll() }, [fetchAll])
 
-  // Mint the existing admin capability only for administrators. The connection card never sits on
-  // the ordinary authenticated API, so non-admin browsers cannot invoke lifecycle operations.
-  useEffect(() => {
-    if (!isAdmin) {
-      setAdmin(null)
-      return
-    }
-    let cancelled = false
-    let stub: RpcStub<AdminApi> | null = null
-    authenticatedApi.getAdminApi().then((api) => {
-      if (cancelled) {
-        api?.[Symbol.dispose]?.()
-        return
-      }
-      if (api) {
-        stub = api
-        setAdmin({ api })
-      }
-    }).catch((error) => {
-      if (!cancelled) console.error('Failed to load Codex admin capability:', error)
-    })
-    return () => {
-      cancelled = true
-      stub?.[Symbol.dispose]?.()
-    }
-  }, [authenticatedApi, isAdmin])
-
   const gatewayMode = aiConfig?.enabled === true
 
   const isBuiltIn = (modelId: string): boolean => {
@@ -206,11 +182,10 @@ function ProvidersPage() {
   }
 
   const modelManagement = (modelId: string): 'built-in' | 'shared' | 'custom' => {
-    if (modelId.startsWith(CODEX_MODEL_PREFIX)) return 'shared'
-    return isBuiltIn(modelId) ? 'built-in' : 'custom'
+    return providerModelManagement(modelId, isBuiltIn(modelId))
   }
 
-  const hasSharedCodex = models.some((model) => model.id.startsWith(CODEX_MODEL_PREFIX))
+  const hasSharedCodex = models.some((model) => isSharedCodexModel(model.id))
 
   const handleDelete = async (model: AiChatAuthorInfo) => {
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
@@ -283,7 +258,7 @@ function ProvidersPage() {
       )}
 
       <div className="chat-panel flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pt-1 pb-16">
-        {isAdmin && <CodexConnectionCard adminApi={admin?.api ?? null} onConnectionChange={fetchAll} />}
+        {isAdmin && <CodexConnectionCard adminApi={adminApi} onConnectionChange={fetchAll} />}
 
         {/* Notices */}
         {(gatewayMode || hasSharedCodex || (!gatewayMode && models.length > 0)) && !loading && !loadError && (
@@ -300,14 +275,7 @@ function ProvidersPage() {
             )}
 
             {hasSharedCodex && (
-              <Notice>
-                <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
-                <span>
-                  <strong className="font-medium text-kumo-default">Shared Codex subscription:</strong>{' '}
-                  these models use the deployment administrator's connection for every authenticated
-                  user. Subscription usage and cost are not shown in AgentOS.
-                </span>
-              </Notice>
+              <SharedCodexNotice />
             )}
 
             {!gatewayMode && models.length > 0 && (
