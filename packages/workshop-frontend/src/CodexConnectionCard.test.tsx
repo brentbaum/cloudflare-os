@@ -60,7 +60,10 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-async function render(api: RpcStub<AdminApi>, onConnectionChange = vi.fn()) {
+async function render(
+  api: RpcStub<AdminApi>,
+  onConnectionChange: () => void | Promise<void> = vi.fn<() => void>(),
+) {
   await act(async () => root.render(
     <CodexConnectionCard adminApi={api} onConnectionChange={onConnectionChange} />,
   ))
@@ -104,8 +107,8 @@ describe('CodexConnectionCard', () => {
     vi.setSystemTime(new Date('2026-08-20T12:00:00Z'))
     const now = Date.now()
     let status: CodexConnectionStatus = { state: 'disconnected', connectionEpoch: 'epoch-0' }
-    const onConnectionChange = vi.fn(async () => {})
-    const poll = vi.fn(async () => {
+    const onConnectionChange = vi.fn<() => Promise<void>>(async () => {})
+    const poll = vi.fn<AdminApi['pollCodexLogin']>(async () => {
       status = { state: 'ready', connectionEpoch: 'epoch-1', expiresAt: now + 60_000 }
       return { state: 'ready' as const, connectionEpoch: 'epoch-1', expiresAt: now + 60_000 }
     })
@@ -137,7 +140,7 @@ describe('CodexConnectionCard', () => {
 
   it('ignores a pending start from an admin stub that has been replaced', async () => {
     const started = deferred<Awaited<ReturnType<AdminApi['startCodexLogin']>>>()
-    const oldStatus = vi.fn(async () => ({
+    const oldStatus = vi.fn<AdminApi['getCodexConnectionStatus']>(async () => ({
       state: 'disconnected' as const, connectionEpoch: 'old-epoch',
     }))
     const oldApi = adminApi({
@@ -194,7 +197,7 @@ describe('CodexConnectionCard', () => {
 
   it('does not continue a pending start after unmount', async () => {
     const started = deferred<Awaited<ReturnType<AdminApi['startCodexLogin']>>>()
-    const getStatus = vi.fn(async () => ({
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>(async () => ({
       state: 'disconnected' as const, connectionEpoch: 'epoch-0',
     }))
     await render(adminApi({
@@ -222,16 +225,16 @@ describe('CodexConnectionCard', () => {
     vi.useFakeTimers()
     const now = Date.now()
     const refreshed = deferred<CodexConnectionStatus>()
-    const getStatus = vi.fn()
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>()
       .mockResolvedValueOnce({
         state: 'pending', connectionEpoch: 'epoch-0', attemptId: 'attempt-1',
         expiresAt: now + 60_000, nextPollAt: now + 100,
       })
       .mockImplementationOnce(() => refreshed.promise)
-    const poll = vi.fn(async () => ({
+    const poll = vi.fn<AdminApi['pollCodexLogin']>(async () => ({
       state: 'ready' as const, connectionEpoch: 'epoch-1', expiresAt: now + 60_000,
     }))
-    const onConnectionChange = vi.fn(async () => {})
+    const onConnectionChange = vi.fn<() => Promise<void>>(async () => {})
     await render(adminApi({ getCodexConnectionStatus: getStatus, pollCodexLogin: poll }),
       onConnectionChange)
 
@@ -251,7 +254,7 @@ describe('CodexConnectionCard', () => {
   it('tears down a pending poll timer when the admin stub changes', async () => {
     vi.useFakeTimers()
     const now = Date.now()
-    const stalePoll = vi.fn()
+    const stalePoll = vi.fn<AdminApi['pollCodexLogin']>()
     const oldApi = adminApi({
       getCodexConnectionStatus: async () => ({
         state: 'pending', connectionEpoch: 'old', attemptId: 'old-attempt',

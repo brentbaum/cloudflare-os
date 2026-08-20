@@ -56,7 +56,7 @@ describe('shared Codex provider policy', () => {
   })
 
   it('does not mint an admin capability for a non-admin user', async () => {
-    const getAdminApi = vi.fn()
+    const getAdminApi = vi.fn<AuthenticatedApi['getAdminApi']>()
     await act(async () => root.render(
       <CapabilityProbe api={authenticatedApi({ getAdminApi })} isAdmin={false} />,
     ))
@@ -65,7 +65,7 @@ describe('shared Codex provider policy', () => {
   })
 
   it('disposes the minted admin capability on unmount', async () => {
-    const dispose = vi.fn()
+    const dispose = vi.fn<() => void>()
     const admin = { [Symbol.dispose]: dispose } as unknown as RpcStub<AdminApi>
     await act(async () => root.render(
       <CapabilityProbe api={authenticatedApi({ getAdminApi: async () => admin })} isAdmin />,
@@ -78,7 +78,7 @@ describe('shared Codex provider policy', () => {
 
   it('disposes a capability that resolves after its owner unmounts', async () => {
     const minted = deferred<RpcStub<AdminApi> | null>()
-    const dispose = vi.fn()
+    const dispose = vi.fn<() => void>()
     await act(async () => root.render(
       <CapabilityProbe
         api={authenticatedApi({ getAdminApi: () => minted.promise })}
@@ -94,7 +94,7 @@ describe('shared Codex provider policy', () => {
   })
 
   it('clears and disposes the old capability while a replacement is pending', async () => {
-    const oldDispose = vi.fn()
+    const oldDispose = vi.fn<() => void>()
     const oldAdmin = { [Symbol.dispose]: oldDispose } as unknown as RpcStub<AdminApi>
     const replacement = deferred<RpcStub<AdminApi> | null>()
     const oldApi = authenticatedApi({ getAdminApi: async () => oldAdmin })
