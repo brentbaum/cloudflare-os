@@ -1,0 +1,28 @@
+{
+  "name": "@gadgets/codex-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist .wrangler",
+    "deploy": "pnpm exec capnweb-validate build --out .wrangler/validate && wrangler deploy -c wrangler.private.jsonc",
+    "test:run": "vitest run && vitest run -c vitest.worker.config.ts",
+    "types:generate": "wrangler types -c wrangler.private.jsonc worker-configuration.d.ts"
+  },
+  "dependencies": {
+    "@gadgets/backend-utils": "workspace:*",
+    "@gadgets/workshop-shared": "workspace:*",
+    "capnweb": "catalog:",
+    "capnweb-validate": "catalog:"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
+    "@cloudflare/workers-types": "^5.20260808.1",
+    "miniflare": "5.20260801.0-alpha",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

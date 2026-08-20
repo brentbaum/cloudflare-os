@@ -22,7 +22,7 @@
 // Gatekeeper OAuth app credentials (CLIENT_ID/CLIENT_SECRET) are deliberately absent: previews
 // exercise routing, auth and the agent, not third-party connector flows.
 
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, dirname, resolve } from "node:path";
@@ -112,6 +112,8 @@ interface PreviewContext {
   baseUrl: string;
   /** Every gatekeeper package name, sorted. */
   gatekeepers: string[];
+  /** Whether this checkout includes the private Codex relay and its fake preview upstream. */
+  codexRelay: boolean;
 }
 
 /** The repository root. */
@@ -137,6 +139,8 @@ export const MAX_PREVIEW_NAME_LENGTH = 28;
 const PREVIEW_NAME_HASH_LENGTH = 8;
 
 const GATEKEEPER_PREFIX = "gatekeeper-";
+const CODEX_RELAY_NAME = "codex-relay";
+const CODEX_FAKE_UPSTREAM_NAME = "codex-fake-upstream";
 
 /** True for the packages that are gatekeeper workers (as opposed to the router and backend). */
 export function isGatekeeper(pkgName: string): boolean {
@@ -363,12 +367,19 @@ function applyGatekeeper(
 
 function applyBackend(
   config: StagingConfig,
-  { baseUrl, gatekeepers }: PreviewContext,
+  { baseUrl, gatekeepers, codexRelay }: PreviewContext,
 ): void {
   // Injected rather than read from wrangler.jsonc, mirroring what manifest-lib.ts hardcodes for
   // every deployed backend (webFetch's toMarkdown conversion depends on it).
   config.ai = { binding: "WORKERS_AI" };
-  config.services = backendGatekeeperServices(gatekeepers, baseUrl);
+  config.services = [
+    ...backendGatekeeperServices(gatekeepers, baseUrl),
+    ...(codexRelay ? [{
+      binding: "CODEX_RELAY",
+      service: CODEX_RELAY_NAME,
+      entrypoint: "CodexRelay",
+    }] : []),
+  ];
   // The origin is the only value the backend needs that is safe to write down here: ADMINS and the
   // Cloudflare Access pair are uploaded as *secrets* instead, out of band, because Wrangler prints
   // every plain-text var's value in its deploy summary and this workflow's logs are public. See
@@ -376,18 +387,29 @@ function applyBackend(
   config.vars = {
     ...config.vars,
     PUBLIC_BASE_URL: baseUrl,
+    ...(codexRelay ? { CODEX_SUBSCRIPTION_ENABLED: "true" } : {}),
   };
   config.previews = {
     observability: previewObservability(config),
     vars: { ...config.vars },
     ...(config.unsafe ? { unsafe: config.unsafe } : {}),
     // preview.ts patches each entry's preview_id once the gatekeeper previews exist.
-    services: backendGatekeeperServices(gatekeepers, baseUrl),
+    services: structuredClone(config.services),
     kv_namespaces: previewResourceBindings(config.kv_namespaces),
     r2_buckets: previewResourceBindings(config.r2_buckets),
     worker_loaders: previewResourceBindings(config.worker_loaders),
     ai: config.ai,
     ...(config.browser ? { browser: config.browser } : {}),
+  };
+}
+
+function applyPrivateCodexWorker(pkgName: string, config: StagingConfig): void {
+  if (pkgName === CODEX_RELAY_NAME) {
+    config.services = [{ binding: "CODEX_UPSTREAM", service: CODEX_FAKE_UPSTREAM_NAME }];
+  }
+  config.previews = {
+    observability: previewObservability(config),
+    ...(config.services ? { services: structuredClone(config.services) } : {}),
   };
 }
 
@@ -428,7 +450,12 @@ export function buildPreviewConfigs({
   }
   const baseUrl = routerPreviewUrl(previewName, workersDevHost);
   const gatekeepers = packages.map((pkg) => pkg.name).filter(isGatekeeper).toSorted();
-  const context: PreviewContext = { baseUrl, gatekeepers };
+  const hasRelay = packages.some((pkg) => pkg.name === CODEX_RELAY_NAME);
+  const hasFakeUpstream = packages.some((pkg) => pkg.name === CODEX_FAKE_UPSTREAM_NAME);
+  if (hasRelay !== hasFakeUpstream) {
+    throw new Error("Codex preview requires both codex-relay and codex-fake-upstream");
+  }
+  const context: PreviewContext = { baseUrl, gatekeepers, codexRelay: hasRelay };
   const configs = new Map<string, StagingConfig>();
 
   for (const pkg of packages) {
@@ -458,6 +485,9 @@ export function buildPreviewConfigs({
     if (isGatekeeper(pkg.name)) applyGatekeeper(pkg.name, config, context);
     else if (pkg.name === "workshop-backend") applyBackend(config, context);
     else if (pkg.name === "router") applyRouter(config, context);
+    else if (pkg.name === CODEX_RELAY_NAME || pkg.name === CODEX_FAKE_UPSTREAM_NAME) {
+      applyPrivateCodexWorker(pkg.name, config);
+    }
     else throw new Error(`cannot build a preview config for package: ${pkg.name}`);
 
     configs.set(pkg.name, config);
@@ -672,10 +702,41 @@ export function backendSecrets({
   };
 }
 
-/** Read every deployable package's wrangler.jsonc off disk. */
+/** Preview-only relay wrapping key uploaded as a secret, never written into generated config. */
+export function codexRelaySecrets({
+  wrappingKey = process.env.PREVIEW_CODEX_WRAPPING_KEY,
+}: { wrappingKey?: string } = {}): Record<string, string> {
+  if (!wrappingKey) {
+    throw new Error("PREVIEW_CODEX_WRAPPING_KEY must be set to deploy the private Codex preview");
+  }
+  const decoded = Buffer.from(wrappingKey, "base64");
+  if (decoded.byteLength !== 32 || decoded.toString("base64") !== wrappingKey) {
+    throw new Error("PREVIEW_CODEX_WRAPPING_KEY must be a canonical base64-encoded 32-byte key");
+  }
+  return { CODEX_WRAPPING_KEY_CURRENT: wrappingKey };
+}
+
+/** Read public deployables plus the two explicit preview-only Codex workers. */
 export function readPackages(): DeployablePackage[] {
-  return findDeployablePackages(PACKAGES_DIR)
+  const packages = findDeployablePackages(PACKAGES_DIR)
       .map(({ name, dir }) => ({ name, dir, config: readWranglerConfig(dir) }));
+  const relayDir = join(PACKAGES_DIR, CODEX_RELAY_NAME);
+  const fakeDir = join(relayDir, "__fixtures__", "fake-upstream");
+  if (existsSync(join(relayDir, "wrangler.private.jsonc"))) {
+    packages.push({
+      name: CODEX_RELAY_NAME,
+      dir: relayDir,
+      config: readWranglerConfig(relayDir, "wrangler.private.jsonc"),
+    });
+  }
+  if (existsSync(join(fakeDir, "wrangler.private.jsonc"))) {
+    packages.push({
+      name: CODEX_FAKE_UPSTREAM_NAME,
+      dir: fakeDir,
+      config: readWranglerConfig(fakeDir, "wrangler.private.jsonc"),
+    });
+  }
+  return packages.toSorted((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Write one package's generated preview config to its `wrangler.staging.jsonc`. */

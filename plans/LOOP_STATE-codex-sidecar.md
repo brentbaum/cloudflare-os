@@ -20,10 +20,10 @@
 | Wave | Status | Exit gate |
 |---|---|---|
 | 0. Contract spine and dependency probes | complete | Shared relay types compile; Pi probe identifies only the external-auth gap; deployment boundary is explicit. |
-| 1A. OAuth, vault, refresh | pending | Pure and Workerd tests cover every state and fail-closed refresh outcome. |
-| 1B. Pi transport seam | pending | Existing bearer behavior passes; external auth streams over an injected fetch. |
-| 1C. AgentOS provider and UI | pending | Namespaced models, admin connection UX, and API-key regressions pass. |
-| 1D. Worker, preview, release harness | pending | Private binding, migration, fake upstream, and release manifest tests pass. |
+| 1A. OAuth, vault, refresh | in progress | Pure and Workerd tests cover every state and fail-closed refresh outcome. |
+| 1B. Pi transport seam | maker complete, checking | Existing bearer behavior passes; external auth streams over an injected fetch. |
+| 1C. AgentOS provider and UI | in progress | Namespaced models, admin connection UX, and API-key regressions pass. |
+| 1D. Worker, preview, release harness | in progress | Private binding, migration, fake upstream, and private/manual deployment tests pass. |
 | 2. Cross-lane integration | pending | Full fake-upstream login through disconnect passes with streaming and cancellation. |
 | 3. Preview and live canary | pending | Public negative probe, canonical live flow, disconnect, and secret scans pass. |
 
@@ -45,6 +45,8 @@ Wave 1: implement the relay vault, Pi external-auth patch, AgentOS integration, 
 - Pi 0.83's Codex catalog contains both locked v1 models: `gpt-5.6-sol` and `gpt-5.6-luna`, each with catalog-owned metadata.
 - Added and compiled the shared `CodexRelayContract`, including sanitized status/device-poll types and the raw Request/Response inference capability.
 - Deployment probe proved that classifying the relay as a gatekeeper would expose it through router wiring. The relay has its own private role.
+- Added the explicit private Worker package/deployment boundary, fake-preview topology, local opt-in wiring, and controlled-canary/rollback runbook.
+- Wave 1B maker commit `4162788` patches only Pi's external authorization seam; independent checking is in progress.
 
 ## Open Questions
 
@@ -64,7 +66,10 @@ Wave 1: implement the relay vault, Pi external-auth patch, AgentOS integration, 
 
 ## Failed Attempts and Why
 
-- None.
+- `worktree-manager.sh create <lane> feat-codex-subscription-sidecar` failed because the manager
+  tries to check out/update the base branch and Git refuses while that branch is active in the
+  integration worktree. Created an unoccupied `codex-wave0` snapshot at `36a0677` and based all
+  lane worktrees on that exact commit instead.
 
 ## Test and Probe Ledger
 
@@ -77,6 +82,10 @@ Wave 1: implement the relay vault, Pi external-auth patch, AgentOS integration, 
 | Pi 0.83 injected-fetch probe | pass | `StreamOptions.fetch` exists and Codex SSE uses it; no fetch patch required. |
 | Pi 0.83 model catalog probe | pass | `gpt-5.6-sol` and `gpt-5.6-luna` are present. |
 | `pnpm --filter @gadgets/workshop-shared build` | pass | Frozen relay RPC contract typechecks. |
+| `node --test scripts/preview/staging-config.test.ts scripts/env-passthrough.test.ts` | pass | 30 tests; private relay/fake topology, safe vars, and preview key handling. |
+| `node --test scripts/release/manifest-lib.test.ts` | pass | 5 tests; current hosted manifest remains stable and explicitly excludes private relay. |
+| preview `config` + `deploy --dry-run` with fake values | pass | 20 private/public Worker configs; four-tier order and no private hostnames. |
+| `pnpm lint` | pass | Existing warnings only; includes scripts typecheck and full workspace build. |
 
 ## Secret-Safety Ledger
 

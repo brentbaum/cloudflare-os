@@ -67,6 +67,13 @@ test("manifest generated from real configs matches the golden file", () => {
       "scripts/release/manifest-lib.test.ts");
 });
 
+test("the private Codex sidecar is excluded until the hosted renderer supports its role", () => {
+  const deployables = findDeployablePackages(join(ROOT, "packages")).map((pkg) => pkg.name);
+  assert.ok(!deployables.includes("codex-relay"));
+  assert.ok(existsSync(join(ROOT, "packages", "codex-relay", "wrangler.private.jsonc")),
+      "the sidecar must remain explicitly deployable through its private config");
+});
+
 test("every $-token in binding templates and vars uses known placeholder syntax", () => {
   const manifest = buildTestManifest();
   const check = (value: unknown, where: string): void => {

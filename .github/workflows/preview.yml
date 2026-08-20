@@ -102,6 +102,8 @@ jobs:
           # `wrangler preview secret bulk`, and never written into a config file — Wrangler prints
           # the values it finds in one, and this log is public.
           PREVIEW_ADMINS: ${{ secrets.PREVIEW_ADMINS }}
+          # Fake-preview credential envelope only. It never wraps a real OAuth token.
+          PREVIEW_CODEX_WRAPPING_KEY: ${{ secrets.PREVIEW_CODEX_WRAPPING_KEY }}
           CF_ACCESS_AUD: ${{ secrets.CF_ACCESS_AUD }}
           CF_ACCESS_ISS: ${{ secrets.CF_ACCESS_ISS }}
           # AI Gateway, so a preview's chats use server-managed keys rather than asking each user

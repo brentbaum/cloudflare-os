@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "codex-relay",
+  "main": ".wrangler/validate/src/index.ts",
+  "build": {
+    "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
+    "watch_dir": "src",
+  },
+  "compatibility_date": "2026-02-02",
+  "workers_dev": false,
+  "preview_urls": false,
+  // CodexAuth is reached through ctx.exports; no explicit namespace binding is required.
+  "migrations": [
+    {
+      "tag": "v0",
+      "new_sqlite_classes": ["CodexAuth"],
+    },
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "invocation_logs": false },
+  },
+}

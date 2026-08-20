@@ -301,9 +301,12 @@ export function findDeployablePackages(packagesDir: string): { name: string; dir
       .map((name) => ({ name, dir: join(packagesDir, name) }));
 }
 
-/** Parse one package's wrangler.jsonc. */
-export function readWranglerConfig(pkgDir: string): WranglerConfig {
-  return parse(readFileSync(join(pkgDir, "wrangler.jsonc"), "utf8")) as WranglerConfig;
+/** Parse one package's Wrangler config. Release callers use the public `wrangler.jsonc` default. */
+export function readWranglerConfig(
+  pkgDir: string,
+  configName = "wrangler.jsonc",
+): WranglerConfig {
+  return parse(readFileSync(join(pkgDir, configName), "utf8")) as WranglerConfig;
 }
 
 /** Read a package's `deploy-inputs.json`, or undefined if it declares none. */

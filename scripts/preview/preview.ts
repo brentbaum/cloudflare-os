@@ -39,6 +39,7 @@ import {
   ROOT,
   STAGING_CONFIG_NAME,
   backendSecrets,
+  codexRelaySecrets,
   gatekeeperShortName,
   generatePreviewConfigs,
   isGatekeeper,
@@ -353,25 +354,25 @@ async function uploadSecrets(
  * before the settings existed would come up with no admins and, worse, no Access application, so it
  * would fall back to password signup on a public URL.
  */
-async function uploadBackendSecrets(
-  backend: DeployablePackage,
+async function uploadPreviewSecrets(
+  worker: DeployablePackage,
   wranglerCommand: string,
   secrets: Record<string, string>,
 ): Promise<void> {
-  let result = await uploadSecrets(backend, wranglerCommand, secrets, { previews: true });
+  let result = await uploadSecrets(worker, wranglerCommand, secrets, { previews: true });
   if (result.status !== 0 && isMissingWorkerError(`${result.stdout}\n${result.stderr}`)) {
-    await deployBaselineWorker(backend, wranglerCommand);
+    await deployBaselineWorker(worker, wranglerCommand);
     // The baseline is briefly live without these, but it is only reachable through the *baseline*
     // router — which is deployed after it, in tier 3, on the same first run.
-    const baseline = await uploadSecrets(backend, wranglerCommand, secrets, { previews: false });
+    const baseline = await uploadSecrets(worker, wranglerCommand, secrets, { previews: false });
     if (baseline.status !== 0) {
-      throw new Error(`wrangler secret bulk failed for baseline worker ${backend.name} with exit ` +
+      throw new Error(`wrangler secret bulk failed for baseline worker ${worker.name} with exit ` +
           `code ${baseline.status}`);
     }
-    result = await uploadSecrets(backend, wranglerCommand, secrets, { previews: true });
+    result = await uploadSecrets(worker, wranglerCommand, secrets, { previews: true });
   }
   if (result.status !== 0) {
-    throw new Error(`wrangler preview secret bulk failed for ${backend.name} with exit code ` +
+    throw new Error(`wrangler preview secret bulk failed for ${worker.name} with exit code ` +
         `${result.status}`);
   }
 }
@@ -442,8 +443,8 @@ async function deletePreview(
 /**
  * Delete one preview from every worker that carries it.
  *
- * Dependents first — the router, then the backend, then the rest concurrently — so nothing is left
- * bound to a preview that no longer exists.
+ * Dependents first — router, backend, relay, then the rest concurrently — so nothing is left bound
+ * to a preview that no longer exists.
  */
 async function deletePreviewFrom(
   workers: readonly DeployablePackage[],
@@ -460,9 +461,12 @@ async function deletePreviewFrom(
   };
 
   const named = (name: string) => workers.filter((pkg) => pkg.name === name);
-  for (const pkg of [...named("router"), ...named("workshop-backend")]) await attempt(pkg);
+  for (const pkg of [
+    ...named("router"), ...named("workshop-backend"), ...named("codex-relay"),
+  ]) await attempt(pkg);
   await mapWithConcurrency(
-      workers.filter((pkg) => !["router", "workshop-backend"].includes(pkg.name)),
+      workers.filter((pkg) =>
+        !["router", "workshop-backend", "codex-relay"].includes(pkg.name)),
       GATEKEEPER_CONCURRENCY, attempt);
 
   for (const failure of failures.slice(1)) {
@@ -552,6 +556,8 @@ function writePreviewComment(
 
 function tiers(packages: readonly DeployablePackage[]): {
   gatekeepers: DeployablePackage[];
+  codexFakeUpstream: DeployablePackage;
+  codexRelay: DeployablePackage;
   backend: DeployablePackage;
   router: DeployablePackage;
 } {
@@ -563,6 +569,8 @@ function tiers(packages: readonly DeployablePackage[]): {
   return {
     gatekeepers: packages.filter((pkg) => isGatekeeper(pkg.name))
         .toSorted((a, b) => a.name.localeCompare(b.name)),
+    codexFakeUpstream: byName("codex-fake-upstream"),
+    codexRelay: byName("codex-relay"),
     backend: byName("workshop-backend"),
     router: byName("router"),
   };
@@ -572,20 +580,23 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
   // First, before a single config is written: a missing CF_ACCESS_AUD/CF_ACCESS_ISS has to fail
   // here rather than after eighteen previews are live with whatever auth they defaulted to.
   const secrets = backendSecrets();
+  const relaySecrets = codexRelaySecrets();
   const { previewName, workersDevHost, baseUrl, packages } = generatePreviewConfigs();
-  const { gatekeepers, backend, router } = tiers(packages);
+  const { gatekeepers, codexFakeUpstream, codexRelay, backend, router } = tiers(packages);
 
   if (dryRun) {
     console.log(`\ndry-run plan for preview "${previewName}" at ${baseUrl}:`);
-    console.log(`  tier 1 (${gatekeepers.length} gatekeepers, concurrently):`);
+    console.log(`  tier 1 (${gatekeepers.length} gatekeepers + fake Codex upstream, concurrently):`);
     for (const pkg of gatekeepers) {
       console.log(`    ${pkg.name} ` +
           `(no hostname; served at ${baseUrl}/gatekeeper/${gatekeeperShortName(pkg.name)})`);
     }
-    console.log(`  tier 2: ${backend.name} (no hostname; served at ` +
+    console.log(`    ${codexFakeUpstream.name} (no hostname; fake data only)`);
+    console.log(`  tier 2: ${codexRelay.name} (no hostname; bound only to fake upstream)`);
+    console.log(`  tier 3: ${backend.name} (no hostname; served at ` +
         `${baseUrl}/api), bound to the tier 1 previews, holding the ` +
         `${Object.keys(secrets).join(", ")} secrets`);
-    console.log(`  tier 3: ${router.name} -> ${baseUrl}, ` +
+    console.log(`  tier 4: ${router.name} -> ${baseUrl}, ` +
         "bound to every preview above");
     return;
   }
@@ -603,11 +614,22 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
         });
     const gatekeeperIds = Object.fromEntries(gatekeeperPreviews);
 
+    const fakePreview = await deployPreview(
+        codexFakeUpstream, previewName, wrangler.command);
+    assertNoPreviewUrl(codexFakeUpstream, fakePreview.url);
+    patchPreviewServiceBindings(codexRelay, {
+      [codexFakeUpstream.name]: fakePreview.id,
+    });
+    await uploadPreviewSecrets(codexRelay, wrangler.command, relaySecrets);
+    const relayPreview = await deployPreview(codexRelay, previewName, wrangler.command);
+    assertNoPreviewUrl(codexRelay, relayPreview.url);
+
     patchPreviewServiceBindings(backend, gatekeeperIds);
+    patchPreviewServiceBindings(backend, { [codexRelay.name]: relayPreview.id });
     patchPreviewServiceBindings(router, gatekeeperIds);
     // Before the backend's preview, not after: a preview inherits the Previews settings that exist
     // when it is created.
-    await uploadBackendSecrets(backend, wrangler.command, secrets);
+    await uploadPreviewSecrets(backend, wrangler.command, secrets);
     const backendPreview = await deployPreview(backend, previewName, wrangler.command);
     assertNoPreviewUrl(backend, backendPreview.url);
 
@@ -630,11 +652,12 @@ async function remove({ dryRun }: { dryRun: boolean }): Promise<void> {
   // Regenerate rather than assume: `delete` runs in its own CI job with a fresh checkout, and
   // wrangler needs a config to know which worker and account the preview belongs to.
   const { packages } = generatePreviewConfigs({ previewName });
-  const { gatekeepers, backend, router } = tiers(packages);
+  const { gatekeepers, codexFakeUpstream, codexRelay, backend, router } = tiers(packages);
 
   if (dryRun) {
     console.log(`\ndry-run: would delete preview "${previewName}" for ` +
-        [router, backend, ...gatekeepers].map((pkg) => pkg.name).join(", "));
+        [router, backend, codexRelay, codexFakeUpstream, ...gatekeepers]
+            .map((pkg) => pkg.name).join(", "));
     return;
   }
 

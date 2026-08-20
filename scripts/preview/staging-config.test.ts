@@ -13,6 +13,7 @@ import {
   R2_MAX_BUCKET_NAME_LENGTH,
   backendSecrets,
   buildPreviewConfigs,
+  codexRelaySecrets,
   gatekeeperBindingName,
   gatekeeperShortName,
   isGatekeeper,
@@ -50,6 +51,7 @@ const SECRETS = backendSecrets({
   access: ACCESS,
   aiGateway: resolveAiGateway(AI_GATEWAY),
 });
+const FAKE_WRAPPING_KEY = Buffer.alloc(32, 7).toString("base64");
 
 /**
  * Every resource binding declared anywhere in the generated configs, as `[where, resource]`.
@@ -193,7 +195,9 @@ test("every deployable package gets a preview config, on the configured account"
 
   assert.equal(configs.size, packages.length);
   assert.ok(configs.has("router") && configs.has("workshop-backend"),
-      "the router and backend are the two non-gatekeeper deployables");
+      "the router and backend are required core deployables");
+  assert.ok(configs.has("codex-relay") && configs.has("codex-fake-upstream"),
+      "preview includes both private Codex workers");
   for (const [name, config] of configs) {
     assert.equal(config.account_id, ACCOUNT_ID, name);
     assert.equal(config.routes, undefined, `${name}: a preview cannot be served from a zone`);
@@ -244,15 +248,16 @@ test("no config names a resource belonging to another deployment", () => {
   }
 });
 
-test("the backend is told the router's origin, and nothing else", () => {
+test("the backend gets only safe preview feature vars", () => {
   const { configs } = buildAll();
   const vars = previewsOf(configs, "workshop-backend").vars;
   assert.ok(vars, "the backend preview declares no vars");
 
   // The origin is the only value the backend needs that is safe to write into a config Wrangler
   // will print; its admins and Access pair are uploaded as secrets instead (below).
-  assert.deepEqual(Object.keys(vars), ["PUBLIC_BASE_URL"]);
+  assert.deepEqual(Object.keys(vars), ["PUBLIC_BASE_URL", "CODEX_SUBSCRIPTION_ENABLED"]);
   assert.equal(vars.PUBLIC_BASE_URL, BASE_URL);
+  assert.equal(vars.CODEX_SUBSCRIPTION_ENABLED, "true");
   // Setting CF_ACCESS_AUD closes the password path on its own — login() and createAccount() both
   // throw once it is set — so this stays unset.
   assert.equal(vars.DISABLE_PASSWORD_AUTH, undefined);
@@ -377,11 +382,16 @@ test("every gatekeeper is bound to the backend by RPC and to the router by HTTP"
   const backend = previewsOf(configs, "workshop-backend").services;
   assert.ok(backend, "the backend preview declares no service bindings");
   assert.deepEqual(backend.map((service) => service.service),
-      gatekeepers);
-  for (const [index, service] of backend.entries()) {
+      [...gatekeepers, "codex-relay"]);
+  for (const [index, service] of backend.slice(0, -1).entries()) {
     assert.equal(service.binding, gatekeeperBindingName(gatekeepers[index]));
     assert.equal(service.entrypoint, "GatekeeperVendor", service.service);
   }
+  assert.deepEqual(backend.at(-1), {
+    binding: "CODEX_RELAY",
+    service: "codex-relay",
+    entrypoint: "CodexRelay",
+  });
 
   const router = previewsOf(configs, "router").services;
   assert.ok(router, "the router preview declares no service bindings");
@@ -393,6 +403,39 @@ test("every gatekeeper is bound to the backend by RPC and to the router by HTTP"
     // The router forwards whole HTTP requests, so it binds the default entrypoint.
     assert.equal(service.entrypoint, undefined, service.service);
   }
+});
+
+test("the Codex sidecar is private and only the backend can reach it", () => {
+  const { configs } = buildAll();
+  const relay = configs.get("codex-relay");
+  const fake = configs.get("codex-fake-upstream");
+  assert.ok(relay && fake);
+  assert.equal(relay.workers_dev, false);
+  assert.equal(relay.preview_urls, false);
+  assert.equal(fake.workers_dev, false);
+  assert.equal(fake.preview_urls, false);
+  assert.deepEqual(previewsOf(configs, "codex-relay").services, [{
+    binding: "CODEX_UPSTREAM",
+    service: "codex-fake-upstream",
+  }]);
+
+  const routerServices = previewsOf(configs, "router").services ?? [];
+  assert.ok(!routerServices.some((service) =>
+    service.service === "codex-relay" || service.service === "codex-fake-upstream"));
+  const backendServices = previewsOf(configs, "workshop-backend").services ?? [];
+  assert.equal(backendServices.filter((service) => service.service === "codex-relay").length, 1);
+  assert.ok(!backendServices.some((service) => service.service === "codex-fake-upstream"));
+  assert.equal(previewsOf(configs, "workshop-backend").vars?.CODEX_SUBSCRIPTION_ENABLED, "true");
+});
+
+test("the fake preview wrapping key is required, validated, and renamed for the relay", () => {
+  assert.deepEqual(codexRelaySecrets({ wrappingKey: FAKE_WRAPPING_KEY }), {
+    CODEX_WRAPPING_KEY_CURRENT: FAKE_WRAPPING_KEY,
+  });
+  assert.throws(() => codexRelaySecrets({ wrappingKey: "" }), /must be set/);
+  assert.throws(() => codexRelaySecrets({ wrappingKey: "not-base64" }), /32-byte key/);
+  assert.throws(() => codexRelaySecrets({ wrappingKey: Buffer.alloc(31).toString("base64") }),
+      /32-byte key/);
 });
 
 test("every gatekeeper is mounted under the router's origin", () => {

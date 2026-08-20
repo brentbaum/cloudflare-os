@@ -119,6 +119,7 @@ export default defineConfig({
         files: [
           'packages/workshop-backend/**/*.ts',
           'packages/router/**/*.ts',
+          'packages/codex-relay/**/*.ts',
           'packages/gatekeeper-*/src/**/*.ts',
           'packages/workshop-shared/**/*.ts',
           'packages/typed-storage/**/*.ts',

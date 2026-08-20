@@ -30,6 +30,7 @@ const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SCRIPTS_DIR, "..");
 const PACKAGES_DIR = join(ROOT, "packages");
 const WORKSHOP_BACKEND_DIR = join(PACKAGES_DIR, "workshop-backend");
+const CODEX_RELAY_DIR = join(PACKAGES_DIR, "codex-relay");
 
 /** A gatekeeper package as {@link findGatekeepers} discovers it. */
 interface Gatekeeper {
@@ -62,6 +63,7 @@ function loadDevVars(): void {
 loadDevVars();
 
 const useWorkersAi = process.argv.includes("--use-workers-ai-binding");
+const useCodexRelay = process.env.CODEX_SUBSCRIPTION_ENABLED === "true";
 
 // In `run-local` mode the backend serves the pre-built frontend bundle as static assets (there is no
 // Vite dev server). In normal dev mode we leave assets unconfigured so the frontend is served by
@@ -320,6 +322,19 @@ for (const gk of gatekeepers) {
   }
 }
 
+// The relay is an explicit private sidecar rather than a gatekeeper: the router must never discover
+// or bind it. Local use is opt-in and reads its wrapping key from packages/codex-relay/.dev.vars,
+// keeping authority out of this generated config and the command line.
+if (useCodexRelay) {
+  const srcPath = join(CODEX_RELAY_DIR, "wrangler.private.jsonc");
+  if (!existsSync(srcPath)) throw new Error(`missing private Codex relay config: ${srcPath}`);
+  const config = parse(readFileSync(srcPath, "utf8"));
+  config.build = devBuildConfig(config.build, CODEX_RELAY_DIR);
+  const outPath = join(CODEX_RELAY_DIR, "wrangler.dev.jsonc");
+  writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
+  console.log(`generated: ${outPath}`);
+}
+
 // Helper: "gatekeeper-github" -> "GATEKEEPER_GITHUB"
 function bindingName(gk: Gatekeeper): string {
   return gk.name.toUpperCase().replaceAll("-", "_");
@@ -487,6 +502,7 @@ for (const gk of gatekeepers) {
     // needs the token even when the binding is present.
     "CF_AI_GATEWAY", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_ACCOUNT_ID",
     "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_USE_BINDING",
+    "CODEX_SUBSCRIPTION_ENABLED",
   ];
   // OAuth app credentials (GOOGLE_/GITHUB_/CLOUDFLARE_OAUTH_*) are NOT passed to the backend anymore;
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).
@@ -506,6 +522,14 @@ for (const gk of gatekeepers) {
       binding.props = { sharingDomain: "dev" };
     }
     config.services.push(binding);
+  }
+
+  if (useCodexRelay) {
+    config.services.push({
+      binding: "CODEX_RELAY",
+      service: "codex-relay",
+      entrypoint: "CodexRelay",
+    });
   }
 
   if (useWorkersAi) {
@@ -538,6 +562,7 @@ for (const gk of gatekeepers) {
 const configs = [
   "wrangler.dev.jsonc",
   join("packages", "workshop-backend", "wrangler.dev.jsonc"),
+  ...(useCodexRelay ? [join("packages", "codex-relay", "wrangler.dev.jsonc")] : []),
   ...gatekeepers.map(gk => join(gk.dir, "wrangler.dev.jsonc")),
 ];
 
