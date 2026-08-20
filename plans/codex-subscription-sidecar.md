@@ -1,6 +1,6 @@
 # AgentOS Codex Subscription Sidecar: Implementation Plan
 
-Status: engineering-reviewed and ready to execute in a fork
+Status: local implementation complete; authenticated preview and canonical live canary pending
 Target: `cloudflare/cloudflare-os` fork, pinned initially to `dd2b015071fe21de49fe2a68b57ef966dde15877`
 Upstream issue: [cloudflare/cloudflare-os#89](https://github.com/cloudflare/cloudflare-os/issues/89)
 Review date: 2026-08-20
@@ -469,33 +469,36 @@ Conflict controls:
 
 ## Build-Actionable Tasks
 
-- [ ] **T1 (P1, human: ~3h / Codex: ~30m) - Contract spine and pin**
+- [x] **T1 (P1, human: ~3h / Codex: ~30m) - Contract spine and pin**
   - Pin upstream and Pi versions; define RPC, state, provider union, errors, fixtures, and the failing Pi seam probe.
   - Verify: typecheck plus focused contract test showing only injected-fetch/external-auth gaps.
-- [ ] **T2 (P1, human: ~1d / Codex: ~2h) - Pi relay transport seam**
+- [x] **T2 (P1, human: ~1d / Codex: ~2h) - Pi relay transport seam**
   - Add backward-compatible external authorization only; use Pi's existing injected fetch, force SSE from AgentOS, and preserve existing Pi tests.
   - Verify: bearer-mode regression, external-mode header absence, Service Binding stream test, upstreamable patch diff.
-- [ ] **T3 (P1, human: ~1.5d / Codex: ~3h) - Workerd-safe OAuth adapter**
+- [x] **T3 (P1, human: ~1.5d / Codex: ~3h) - Workerd-safe OAuth adapter**
   - Port device start, one poll, exchange, refresh, validation, JWT claim extraction, classification, and redaction from pinned Pi/OMP.
   - Verify: deterministic pure tests for every fixture and clock boundary.
-- [ ] **T4 (P1, human: ~2d / Codex: ~4h) - Credential Durable Object**
+- [x] **T4 (P1, human: ~2d / Codex: ~4h) - Credential Durable Object**
   - Implement versioned encrypted storage, attempt replacement, request-time refresh, single-flight, generation marker, fail-closed restart, and disconnect.
   - Verify: Workers Vitest storage, concurrency, eviction, injected fault, and plaintext inspection tests.
 - [ ] **T5 (P1, human: ~1d / Codex: ~2h) - Private inference relay**
   - Implement typed entrypoint, fixed request policy, credential/header injection, response allowlist, raw streaming, and cancellation.
   - Verify: SSRF/header attacks, body/model/media limits, SSE semantic cases, bounded memory, and public 404.
-- [ ] **T6 (P2, human: ~1.5d / Codex: ~3h) - AgentOS provider integration**
+  - Functional/security tests, 1 MB/50 MB raw-stream/no-materialization fixtures, local p95, and local cancellation proxies pass. Deployed queue-depth/RSS, regional latency, and cancellation gates remain open.
+- [x] **T6 (P2, human: ~1.5d / Codex: ~3h) - AgentOS provider integration**
   - Add `openai-codex`, bypass gateways, derive internal connection keys, project namespaced catalog models, and preserve unknown cost.
   - Verify: model resolver, coexistence, gateway bypass, quick/preferred selection, old-chat error, and API-key regressions.
-- [ ] **T7 (P2, human: ~1d / Codex: ~2h) - Provider UI and admin controls**
+- [x] **T7 (P2, human: ~1d / Codex: ~2h) - Provider UI and admin controls**
   - Add connect/poll/restart/disconnect flows and all visible states; restrict management to admins while exposing shared model availability to authenticated users.
   - Verify: frontend state tests, non-admin authorization tests, and no-secret response scan.
 - [ ] **T8 (P1, human: ~1.5d / Codex: ~3h) - Preview and release integration**
   - Add sidecar Wrangler config, DO migration, generated types, Service Binding, build tasks, preview topology, fake upstream, and private/manual deployment ordering.
   - Verify: package tests, staging-config tests, preview deploy, negative route probe, rollback dry run. Hosted one-click release remains gated on the out-of-repository deploy renderer learning the new private sidecar role; do not emit a manifest the current renderer cannot deploy.
-- [ ] **T9 (P1, human: ~1d / Codex: ~2h) - Cross-package failure suite**
+  - Local package/config generation, Wrangler dry-runs, and fake preview deploy/delete dry-runs pass. The real preview, negative network probe, and teardown await renewed Cloudflare authentication.
+- [x] **T9 (P1, human: ~1d / Codex: ~2h) - Cross-package failure suite**
   - Exercise login through disconnect, tool continuation, refresh races, ambiguous faults, stream cancellation, gateway bypass, and secret scans.
   - Verify: all focused suites and root `pnpm test`, `pnpm lint`, and `pnpm build`.
+  - Text, authenticated image, multi-turn tool continuation, refresh, cancellation, billing bypass, premature-stream failure, disconnect, and historical-chat cases pass through the real backend/Overseer path.
 - [ ] **T10 (P1, human: ~3h / Codex: ~30m) - Controlled live canary and runbook**
   - Validate one canonical account, capture only non-secret evidence, document enable/disable/reconnect/rollback, and keep public distribution blocked.
   - Verify: signed-off canary checklist and zero secret-scan matches.
