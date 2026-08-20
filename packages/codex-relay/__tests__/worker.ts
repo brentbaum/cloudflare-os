@@ -3,7 +3,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 
 export { CodexAuth, CodexRelay, default } from "../src/index.js";
 
-type StreamMode = "complete" | "cancellable";
+type StreamMode = "complete" | "cancellable" | "premature" | "sized";
 type ExchangeMode = "success" | "malformed" | "server-error";
 type RefreshMode = "success" | "server-error" | "rate-limited";
 
@@ -20,6 +20,12 @@ let lastInferenceHeaders: Record<string, string> = {};
 let lastInferenceBody = "";
 let exchangeMode: ExchangeMode = "success";
 let refreshMode: RefreshMode = "success";
+let refreshRetryAfterSeconds = 1;
+let streamTotalBytes = 0;
+let streamChunkBytes = 0;
+let streamBytesProduced = 0;
+let streamActivePulls = 0;
+let streamMaxActivePulls = 0;
 
 function fakeJwt(accountId: string, generation: number): string {
   const payload = btoa(
@@ -68,7 +74,7 @@ export class TestUpstream extends WorkerEntrypoint {
         if (refreshMode === "rate-limited")
           return Response.json({ error: "rate_limit_fake" }, {
             status: 429,
-            headers: { "Retry-After": "1" },
+            headers: { "Retry-After": String(refreshRetryAfterSeconds) },
           });
         return Response.json(fakeCredential(refreshCalls + 1, 3600));
       }
@@ -86,7 +92,43 @@ export class TestUpstream extends WorkerEntrypoint {
         unauthorizedOnce = false;
         return Response.json({ error: "fake_unauthorized" }, { status: 401 });
       }
-      if (streamMode !== "complete") {
+      if (streamMode === "sized") {
+        const stream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            streamActivePulls++;
+            streamMaxActivePulls = Math.max(streamMaxActivePulls, streamActivePulls);
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 1));
+              if (streamBytesProduced >= streamTotalBytes) {
+                controller.close();
+                return;
+              }
+              const size = Math.min(streamChunkBytes, streamTotalBytes - streamBytesProduced);
+              streamBytesProduced += size;
+              controller.enqueue(new Uint8Array(size).fill(0x66));
+              if (streamBytesProduced >= streamTotalBytes) controller.close();
+            } finally {
+              streamActivePulls--;
+            }
+          },
+        });
+        return new Response(stream, { headers: { "Content-Type": "application/octet-stream" } });
+      }
+      if (streamMode === "premature") {
+        let first = true;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (first) {
+              first = false;
+              controller.enqueue(new TextEncoder().encode("data: fake-partial"));
+              return;
+            }
+            controller.close();
+          },
+        });
+        return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
+      }
+      if (streamMode === "cancellable") {
         let first = true;
         let heartbeat: ReturnType<typeof setTimeout> | undefined;
         let cancellationObserved = false;
@@ -144,6 +186,12 @@ export class TestUpstream extends WorkerEntrypoint {
     lastInferenceBody = "";
     exchangeMode = "success";
     refreshMode = "success";
+    refreshRetryAfterSeconds = 1;
+    streamTotalBytes = 0;
+    streamChunkBytes = 0;
+    streamBytesProduced = 0;
+    streamActivePulls = 0;
+    streamMaxActivePulls = 0;
   }
 
   setInitialExpiresIn(seconds: number): void {
@@ -156,6 +204,10 @@ export class TestUpstream extends WorkerEntrypoint {
 
   setRefreshMode(mode: RefreshMode): void {
     refreshMode = mode;
+  }
+
+  setRefreshRetryAfter(seconds: number): void {
+    refreshRetryAfterSeconds = seconds;
   }
 
   blockRefresh(): void {
@@ -172,6 +224,15 @@ export class TestUpstream extends WorkerEntrypoint {
 
   setStreamMode(mode: StreamMode): void {
     streamMode = mode;
+  }
+
+  configureSizedStream(totalBytes: number, chunkBytes: number): void {
+    streamMode = "sized";
+    streamTotalBytes = totalBytes;
+    streamChunkBytes = chunkBytes;
+    streamBytesProduced = 0;
+    streamActivePulls = 0;
+    streamMaxActivePulls = 0;
   }
 
   rejectNextInferenceAsUnauthorized(): void {
@@ -195,6 +256,9 @@ export class TestUpstream extends WorkerEntrypoint {
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
     lastInferenceBody: string;
+    streamBytesProduced: number;
+    streamChunkBytes: number;
+    streamMaxActivePulls: number;
   } {
     return {
       exchangeCalls,
@@ -203,6 +267,9 @@ export class TestUpstream extends WorkerEntrypoint {
       streamCancellations,
       lastInferenceHeaders,
       lastInferenceBody,
+      streamBytesProduced,
+      streamChunkBytes,
+      streamMaxActivePulls,
     };
   }
 }

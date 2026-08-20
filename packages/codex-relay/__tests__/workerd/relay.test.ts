@@ -11,10 +11,12 @@ type TestUpstreamControl = {
   setInitialExpiresIn(seconds: number): Promise<void>;
   setExchangeMode(mode: "success" | "malformed" | "server-error"): Promise<void>;
   setRefreshMode(mode: "success" | "server-error" | "rate-limited"): Promise<void>;
+  setRefreshRetryAfter(seconds: number): Promise<void>;
   blockRefresh(): Promise<void>;
   releaseRefresh(): Promise<void>;
   rejectNextInferenceAsUnauthorized(): Promise<void>;
-  setStreamMode(mode: "complete" | "cancellable"): Promise<void>;
+  setStreamMode(mode: "complete" | "cancellable" | "premature"): Promise<void>;
+  configureSizedStream(totalBytes: number, chunkBytes: number): Promise<void>;
   waitForRefreshCalls(count: number): Promise<void>;
   waitForStreamCancellation(): Promise<void>;
   read(): Promise<{
@@ -24,6 +26,9 @@ type TestUpstreamControl = {
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
     lastInferenceBody: string;
+    streamBytesProduced: number;
+    streamChunkBytes: number;
+    streamMaxActivePulls: number;
   }>;
 };
 
@@ -359,7 +364,8 @@ describe("Codex relay in Workerd", () => {
       await forcePollDue(stub);
 
       await expect(testEnv.CODEX_RELAY.pollLogin(name, authorization.attemptId)).resolves.toEqual({
-        state: "superseded",
+        state: "failed",
+        reconnectRequired: true,
       });
       await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
         state: "reauth-required",
@@ -384,7 +390,8 @@ describe("Codex relay in Workerd", () => {
         .mockRejectedValueOnce(new Error("fake encryption fault"));
       try {
         await expect(instance.pollLogin(authorization.attemptId)).resolves.toEqual({
-          state: "superseded",
+          state: "failed",
+          reconnectRequired: true,
         });
       } finally {
         encrypt.mockRestore();
@@ -422,7 +429,8 @@ describe("Codex relay in Workerd", () => {
       });
       try {
         await expect(instance.pollLogin(authorization.attemptId)).resolves.toEqual({
-          state: "superseded",
+          state: "failed",
+          reconnectRequired: true,
         });
       } finally {
         put.mockRestore();
@@ -448,6 +456,61 @@ describe("Codex relay in Workerd", () => {
       state: "reauth-required",
       reason: "ambiguous_refresh",
     });
+  });
+
+  it("persists a generation-scoped 429 cooldown and coalesces callers before retry", async () => {
+    const name = "refresh-rate-limit-cooldown";
+    const stub = await connect(name, 0);
+    await testEnv.CODEX_UPSTREAM.setRefreshRetryAfter(999_999);
+    await testEnv.CODEX_UPSTREAM.setRefreshMode("rate-limited");
+    await testEnv.CODEX_UPSTREAM.blockRefresh();
+
+    const coalescedPromise = Promise.all(
+      Array.from({ length: 20 }, () => testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+    );
+    await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
+    expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
+    await testEnv.CODEX_UPSTREAM.releaseRefresh();
+    const coalesced = await coalescedPromise;
+    expect(coalesced.every((response) => response.status === 503)).toBe(true);
+    expect(coalesced.every((response) => response.headers.get("retry-after") === "300")).toBe(true);
+    await expect(coalesced[0]?.json()).resolves.toEqual({
+      error: { code: "refresh_failed", message: "Codex authentication is unavailable" },
+    });
+    await Promise.all(coalesced.slice(1).map((response) => response.arrayBuffer()));
+
+    const blocked = await Promise.all(
+      Array.from({ length: 5 }, () => testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+    );
+    expect(blocked.every((response) => response.status === 503)).toBe(true);
+    expect(blocked.every((response) => response.headers.get("retry-after") === "300")).toBe(true);
+    await Promise.all(blocked.map((response) => response.arrayBuffer()));
+    expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
+
+    const persisted = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get<{
+        generation: number;
+        refreshRetry?: { generation: number; notBefore: number };
+      }>(STATE_KEY),
+    );
+    expect(persisted?.refreshRetry).toMatchObject({ generation: persisted?.generation });
+    expect((persisted?.refreshRetry?.notBefore ?? Infinity) - Date.now()).toBeLessThanOrEqual(
+      5 * 60 * 1000,
+    );
+    await runInDurableObject(stub, async (_instance, state) => {
+      const current = await state.storage.get<Record<string, unknown>>(STATE_KEY);
+      if (!current) throw new Error("Missing rate-limited fake state");
+      await state.storage.put(STATE_KEY, {
+        ...current,
+        refreshRetry: { generation: current.generation, notBefore: 0 },
+      });
+    });
+    await testEnv.CODEX_UPSTREAM.setRefreshMode("success");
+
+    const retried = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+    expect(retried.status).toBe(200);
+    await retried.arrayBuffer();
+    expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(2);
   });
 
   it("reserves credential-state-unknown for local credential corruption", async () => {
@@ -552,6 +615,50 @@ describe("Codex relay in Workerd", () => {
       ),
     ]);
     expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(1);
+  });
+
+  it.each([1 * 1024 * 1024, 50 * 1024 * 1024])(
+    "streams %i bytes through both relay hops with bounded producer pulls",
+    async (totalBytes) => {
+      const name = `sized-stream-${totalBytes}`;
+      const chunkBytes = totalBytes === 1024 * 1024 ? 256 * 1024 : 5 * 1024 * 1024;
+      await connect(name);
+      await testEnv.CODEX_UPSTREAM.configureSizedStream(totalBytes, chunkBytes);
+
+      const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+      expect(response.status).toBe(200);
+      expect((await testEnv.CODEX_UPSTREAM.read()).streamBytesProduced).toBeLessThanOrEqual(
+        chunkBytes,
+      );
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Missing sized fake response body");
+      let received = 0;
+      while (received < totalBytes) {
+        const chunk = await reader.read();
+        expect(chunk.done).toBe(false);
+        expect(chunk.value?.byteLength).toBeLessThanOrEqual(chunkBytes);
+        received += chunk.value?.byteLength ?? 0;
+      }
+      await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+      expect(received).toBe(totalBytes);
+      expect(await testEnv.CODEX_UPSTREAM.read()).toMatchObject({
+        streamChunkBytes: chunkBytes,
+        streamBytesProduced: totalBytes,
+        streamMaxActivePulls: 1,
+      });
+    },
+    60_000,
+  );
+
+  it("preserves a premature SSE closure for downstream incomplete-stream classification", async () => {
+    await connect("premature-stream");
+    await testEnv.CODEX_UPSTREAM.setStreamMode("premature");
+    const response = await testEnv.CODEX_RELAY.infer("premature-stream", inferenceRequest());
+    const reader = response.body?.getReader();
+    const first = await reader?.read();
+    expect(new TextDecoder().decode(first?.value)).toBe("data: fake-partial");
+    await expect(reader?.read()).resolves.toEqual({ done: true, value: undefined });
+    expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(0);
   });
 
   it("keeps the public Worker dark and exposes management only over RPC", async () => {

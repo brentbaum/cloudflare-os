@@ -27,5 +27,18 @@ export default defineConfig({
   test: {
     include: ["__tests__/workerd/*.test.ts"],
     setupFiles: ["../../scripts/assert-workerd.ts"],
+    coverage: {
+      enabled: true,
+      provider: "istanbul",
+      include: ["src/vault.ts"],
+      reporter: ["text"],
+      reportsDirectory: "coverage/workerd",
+      thresholds: {
+        statements: 82,
+        branches: 75,
+        functions: 95,
+        lines: 82,
+      },
+    },
   },
 });

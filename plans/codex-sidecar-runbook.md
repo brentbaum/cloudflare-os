@@ -42,8 +42,9 @@ The hosted deploy renderer does not yet support required private sidecars. The r
    to start the one canonical device login.
 
 For key rotation, set the old value as `CODEX_WRAPPING_KEY_PREVIOUS`, install the new current key,
-deploy, and exercise one credential read/write before removing the previous secret. Never generate
-both keys inside the Durable Object whose contents they protect.
+deploy, and complete a credential refresh or reconnect before removing the previous secret. A
+status read does not rewrap stored ciphertext. Never generate both keys inside the Durable Object
+whose contents they protect.
 
 ## Fake preview
 

@@ -34,6 +34,7 @@ export type CodexDevicePollResult =
   | { state: "ready"; connectionEpoch: string; expiresAt: number }
   | { state: "expired" }
   | { state: "denied" }
+  | { state: "failed"; reconnectRequired: true }
   | { state: "superseded" };
 
 /**

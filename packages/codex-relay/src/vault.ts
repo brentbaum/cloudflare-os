@@ -28,6 +28,8 @@ import {
 const STATE_KEY = "codex-auth-state";
 const STATE_VERSION = 1 as const;
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+const MIN_REFRESH_RETRY_MS = 1_000;
+const MAX_REFRESH_RETRY_MS = 5 * 60 * 1000;
 
 type RelayEnv = {
   CODEX_WRAPPING_KEY_CURRENT: string;
@@ -56,6 +58,7 @@ type PendingState = {
 };
 
 type RefreshMarker = { generation: number; attemptId: string; startedAt: number };
+type RefreshRetry = { generation: number; notBefore: number };
 
 type ReadyState = {
   version: typeof STATE_VERSION;
@@ -65,6 +68,7 @@ type ReadyState = {
   generation: number;
   credential: EncryptedEnvelope;
   refresh?: RefreshMarker;
+  refreshRetry?: RefreshRetry;
 };
 
 type StoredState =
@@ -111,11 +115,17 @@ function sameRefreshMarker(
     left.startedAt === right.startedAt;
 }
 
+function sameRefreshRetry(left: RefreshRetry | undefined, right: RefreshRetry | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.generation === right.generation && left.notBefore === right.notBefore;
+}
+
 function sameReadyState(current: StoredState, expected: ReadyState): current is ReadyState {
   return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
     current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
     sameEnvelope(current.credential, expected.credential) &&
-    sameRefreshMarker(current.refresh, expected.refresh);
+    sameRefreshMarker(current.refresh, expected.refresh) &&
+    sameRefreshRetry(current.refreshRetry, expected.refreshRetry);
 }
 
 function ownsRefresh(
@@ -126,6 +136,7 @@ function ownsRefresh(
   return current.state === "ready" && current.connectionEpoch === expected.connectionEpoch &&
     current.expiresAt === expected.expiresAt && current.generation === expected.generation &&
     sameEnvelope(current.credential, expected.credential) &&
+    sameRefreshRetry(current.refreshRetry, expected.refreshRetry) &&
     current.refresh?.generation === marker.generation &&
     current.refresh.attemptId === marker.attemptId &&
     current.refresh.startedAt === marker.startedAt;
@@ -144,6 +155,7 @@ class AuthStateError extends Error {
       | "reauth_required"
       | "credential_state_unknown"
       | "refresh_failed",
+    public readonly retryAfterMs?: number,
   ) {
     super(code);
     this.name = "AuthStateError";
@@ -158,14 +170,25 @@ function authErrorResponse(error: unknown): Response {
   if (error instanceof AuthStateError) {
     const status =
       error.code === "credential_state_unknown" || error.code === "refresh_failed" ? 503 : 401;
+    const headers = new Headers();
+    if (error.code === "refresh_failed" && error.retryAfterMs !== undefined) {
+      headers.set("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+    }
     return Response.json(
       { error: { code: error.code, message: "Codex authentication is unavailable" } },
-      { status },
+      { status, headers },
     );
   }
   return Response.json(
     { error: { code: "relay_unavailable", message: "Codex relay is temporarily unavailable" } },
     { status: 503 },
+  );
+}
+
+function boundedRefreshRetryMs(value: number | undefined): number {
+  return Math.min(
+    MAX_REFRESH_RETRY_MS,
+    Math.max(MIN_REFRESH_RETRY_MS, value ?? MIN_REFRESH_RETRY_MS),
   );
 }
 
@@ -432,11 +455,15 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         await this.#writeState(current);
         throw error;
       }
-      await this.#writeState({
-        ...exchangeMarker,
-        reason: "authorization_code_exchange_failed",
-      });
-      return { state: "superseded" };
+      try {
+        await this.#writeState({
+          ...exchangeMarker,
+          reason: "authorization_code_exchange_failed",
+        });
+      } catch {
+        // The pre-dispatch marker is already terminal and prevents code replay.
+      }
+      return { state: "failed", reconnectRequired: true };
     }
     const afterExchange = await this.#readRawState();
     if (!ownsExchange(afterExchange, exchangeMarker)) {
@@ -449,7 +476,12 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     } catch {
       const afterFailure = await this.#readRawState();
       if (ownsExchange(afterFailure, exchangeMarker)) {
-        await this.#writeState({ ...exchangeMarker, reason: "credential_encryption_failed" });
+        try {
+          await this.#writeState({ ...exchangeMarker, reason: "credential_encryption_failed" });
+        } catch {
+          // The exchange marker remains terminal when its diagnostic refinement cannot commit.
+        }
+        return { state: "failed", reconnectRequired: true };
       }
       return { state: "superseded" };
     }
@@ -472,9 +504,11 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         const afterFailure = await this.#readRawState();
         if (ownsExchange(afterFailure, exchangeMarker)) {
           await this.#writeState({ ...exchangeMarker, reason: "credential_commit_failed" });
+          return { state: "failed", reconnectRequired: true };
         }
       } catch {
         // The durable pre-dispatch marker remains terminal even when this diagnostic write fails.
+        return { state: "failed", reconnectRequired: true };
       }
       return { state: "superseded" };
     }
@@ -510,6 +544,12 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     }
     if (!forceRefresh && credential.expiresAt - Date.now() > REFRESH_MARGIN_MS) {
       return { credential, refreshed: false };
+    }
+    if (
+      state.refreshRetry?.generation === state.generation &&
+      Date.now() < state.refreshRetry.notBefore
+    ) {
+      throw new AuthStateError("refresh_failed", state.refreshRetry.notBefore - Date.now());
     }
     if (this.#refreshPromise) return this.#refreshPromise;
 
@@ -559,8 +599,13 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       }
       if (error instanceof OAuthProtocolError && error.kind === "transient") {
         const { refresh: _refresh, ...restored } = current;
-        await this.#writeState(restored);
-        throw new AuthStateError("refresh_failed");
+        const retryAfterMs = boundedRefreshRetryMs(error.retryAfterMs);
+        const retryNotBefore = Date.now() + retryAfterMs;
+        await this.#writeState({
+          ...restored,
+          refreshRetry: { generation: current.generation, notBefore: retryNotBefore },
+        });
+        throw new AuthStateError("refresh_failed", retryAfterMs);
       }
       await this.#writeState({
         version: STATE_VERSION,

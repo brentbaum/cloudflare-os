@@ -60,6 +60,8 @@ function copyPollResult(result: CodexDevicePollResult): CodexDevicePollResult {
     case "expired":
     case "superseded":
       return { state: result.state };
+    case "failed":
+      return { state: "failed", reconnectRequired: true };
   }
 }
 
