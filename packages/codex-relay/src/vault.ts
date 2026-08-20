@@ -77,6 +77,7 @@ type StoredState =
       state: "reauth-required";
       connectionEpoch: string;
       reason: string;
+      attemptId?: string;
     }
   | {
       version: typeof STATE_VERSION;
@@ -169,7 +170,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       return state;
     const unknown: StoredState = {
       version: STATE_VERSION,
-      state: "credential-state-unknown",
+      state: "reauth-required",
       connectionEpoch: state.connectionEpoch,
       reason: "interrupted_refresh",
     };
@@ -250,6 +251,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
         userCode: authorization.userCode,
       } satisfies PendingSecret,
       this.#objectId,
+      STATE_VERSION,
       "pending",
     );
     const afterEncryption = await this.#readRawState();
@@ -306,7 +308,12 @@ export class CodexAuth extends DurableObject<RelayEnv> {
     const keyring = await this.#keyringPromise;
     let secret: PendingSecret;
     try {
-      secret = await keyring.decrypt<PendingSecret>(state.pending, this.#objectId, "pending");
+      secret = await keyring.decrypt<PendingSecret>(
+        state.pending,
+        this.#objectId,
+        STATE_VERSION,
+        "pending",
+      );
     } catch {
       await this.#writeState({
         version: STATE_VERSION,
@@ -346,30 +353,81 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       return { state: poll.state };
     }
 
-    const credential = await exchangeDeviceCode(
-      poll.authorizationCode,
-      poll.codeVerifier,
-      Date.now(),
-      this.#providerFetch,
-    );
-    const afterExchange = await this.#readRawState();
-    if (afterExchange.state !== "pending" || afterExchange.attemptId !== attemptId) {
+    // Persist a terminal marker before dispatching the one-time authorization code. A reset,
+    // non-definitive provider response, encryption failure, or ready-state commit failure can then
+    // never leave a replayable pending code behind.
+    const exchangeMarker: StoredState = {
+      version: STATE_VERSION,
+      state: "reauth-required",
+      connectionEpoch: current.connectionEpoch,
+      reason: "authorization_code_exchange_in_progress",
+      attemptId,
+    };
+    await this.#writeState(exchangeMarker);
+
+    let credential: CodexCredential;
+    try {
+      credential = await exchangeDeviceCode(
+        poll.authorizationCode,
+        poll.codeVerifier,
+        Date.now(),
+        this.#providerFetch,
+      );
+    } catch (error) {
+      const afterFailure = await this.#readRawState();
+      if (afterFailure.state !== "reauth-required" || afterFailure.attemptId !== attemptId) {
+        return { state: "superseded" };
+      }
+      if (error instanceof OAuthProtocolError && error.kind === "transient") {
+        await this.#writeState(current);
+        throw error;
+      }
+      await this.#writeState({
+        ...exchangeMarker,
+        reason: "authorization_code_exchange_failed",
+      });
       return { state: "superseded" };
     }
-    const encrypted = await keyring.encrypt(credential, this.#objectId, "credential");
+    const afterExchange = await this.#readRawState();
+    if (afterExchange.state !== "reauth-required" || afterExchange.attemptId !== attemptId) {
+      return { state: "superseded" };
+    }
+
+    let encrypted: EncryptedEnvelope;
+    try {
+      encrypted = await keyring.encrypt(credential, this.#objectId, STATE_VERSION, "credential");
+    } catch {
+      const afterFailure = await this.#readRawState();
+      if (afterFailure.state === "reauth-required" && afterFailure.attemptId === attemptId) {
+        await this.#writeState({ ...exchangeMarker, reason: "credential_encryption_failed" });
+      }
+      return { state: "superseded" };
+    }
     const afterEncryption = await this.#readRawState();
-    if (afterEncryption.state !== "pending" || afterEncryption.attemptId !== attemptId) {
+    if (afterEncryption.state !== "reauth-required" || afterEncryption.attemptId !== attemptId) {
       return { state: "superseded" };
     }
     const connectionEpoch = newId();
-    await this.#writeState({
-      version: STATE_VERSION,
-      state: "ready",
-      connectionEpoch,
-      expiresAt: credential.expiresAt,
-      generation: 1,
-      credential: encrypted,
-    });
+    try {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "ready",
+        connectionEpoch,
+        expiresAt: credential.expiresAt,
+        generation: 1,
+        credential: encrypted,
+      });
+    } catch {
+      try {
+        const afterFailure = await this.#readRawState();
+        if (afterFailure.state === "reauth-required" && afterFailure.attemptId === attemptId) {
+          await this.#writeState({ ...exchangeMarker, reason: "credential_commit_failed" });
+        }
+      } catch {
+        // The durable pre-dispatch marker remains terminal even when this diagnostic write fails.
+      }
+      return { state: "superseded" };
+    }
     return { state: "ready", connectionEpoch, expiresAt: credential.expiresAt };
   }
 
@@ -386,6 +444,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       credential = await keyring.decrypt<CodexCredential>(
         state.credential,
         this.#objectId,
+        STATE_VERSION,
         "credential",
       );
     } catch {
@@ -448,11 +507,11 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       }
       await this.#writeState({
         version: STATE_VERSION,
-        state: "credential-state-unknown",
+        state: "reauth-required",
         connectionEpoch: state.connectionEpoch,
         reason: "ambiguous_refresh",
       });
-      throw new AuthStateError("credential_state_unknown");
+      throw new AuthStateError("reauth_required");
     }
 
     const current = await this.#readRawState();
@@ -465,7 +524,18 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       throw new AuthStateError("disconnected");
     }
     const keyring = await this.#keyringPromise;
-    const encrypted = await keyring.encrypt(refreshed, this.#objectId, "credential");
+    let encrypted: EncryptedEnvelope;
+    try {
+      encrypted = await keyring.encrypt(refreshed, this.#objectId, STATE_VERSION, "credential");
+    } catch {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "credential-state-unknown",
+        connectionEpoch: state.connectionEpoch,
+        reason: "refresh_encryption_failed",
+      });
+      throw new AuthStateError("credential_state_unknown");
+    }
     const next: ReadyState = {
       version: STATE_VERSION,
       state: "ready",

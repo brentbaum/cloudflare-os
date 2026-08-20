@@ -1,12 +1,16 @@
 import { env } from "cloudflare:workers";
 import { abortAllDurableObjects, reset, runInDurableObject, SELF } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { zstdCompressSync } from "node:zlib";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexRelayContract } from "@gadgets/workshop-shared/codex-relay";
 import type { CodexAuth } from "../../src/vault.js";
+import { MAX_INFERENCE_BODY_BYTES } from "../../src/policy.js";
 
 type TestUpstreamControl = {
   reset(): Promise<void>;
   setInitialExpiresIn(seconds: number): Promise<void>;
+  setExchangeMode(mode: "success" | "malformed" | "server-error"): Promise<void>;
+  setRefreshMode(mode: "success" | "server-error"): Promise<void>;
   blockRefresh(): Promise<void>;
   releaseRefresh(): Promise<void>;
   rejectNextInferenceAsUnauthorized(): Promise<void>;
@@ -14,10 +18,12 @@ type TestUpstreamControl = {
   waitForRefreshCalls(count: number): Promise<void>;
   waitForStreamCancellation(): Promise<void>;
   read(): Promise<{
+    exchangeCalls: number;
     refreshCalls: number;
     inferenceCalls: number;
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
+    lastInferenceBody: string;
   }>;
 };
 
@@ -29,7 +35,7 @@ const testEnv = env as unknown as {
 
 const STATE_KEY = "codex-auth-state";
 
-function inferenceRequest(): Request {
+function inferenceRequest(signal?: AbortSignal): Request {
   return new Request("https://caller.invalid/backend-api/codex/responses", {
     method: "POST",
     headers: {
@@ -40,7 +46,27 @@ function inferenceRequest(): Request {
       Host: "caller-host-must-not-cross.invalid",
     },
     body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: "fake prompt" }),
+    signal,
   });
+}
+
+async function zstdInferenceRequest(body: unknown): Promise<Request> {
+  const encoded = new TextEncoder().encode(JSON.stringify(body));
+  const compressed = zstdCompressSync(encoded);
+  return new Request("https://caller.invalid/backend-api/codex/responses", {
+    method: "POST",
+    headers: {
+      "Content-Encoding": "zstd",
+      "Content-Type": "application/json",
+    },
+    body: compressed,
+  });
+}
+
+async function statusAfterConsume(responsePromise: Promise<Response>): Promise<number> {
+  const response = await responsePromise;
+  await response.arrayBuffer();
+  return response.status;
 }
 
 async function forcePollDue(stub: DurableObjectStub<CodexAuth>): Promise<void> {
@@ -54,9 +80,9 @@ async function forcePollDue(stub: DurableObjectStub<CodexAuth>): Promise<void> {
 async function connect(name: string, expiresIn = 3600): Promise<DurableObjectStub<CodexAuth>> {
   await testEnv.CODEX_UPSTREAM.setInitialExpiresIn(expiresIn);
   const stub = testEnv.CODEX_AUTH.getByName(name);
-  const authorization = await stub.startLogin();
+  const authorization = await testEnv.CODEX_RELAY.startLogin(name);
   await forcePollDue(stub);
-  const result = await stub.pollLogin(authorization.attemptId);
+  const result = await testEnv.CODEX_RELAY.pollLogin(name, authorization.attemptId);
   expect(result.state).toBe("ready");
   return stub;
 }
@@ -91,16 +117,19 @@ describe("Codex relay in Workerd", () => {
   });
 
   it("coalesces concurrent request-time refreshes behind one durable marker", async () => {
-    const stub = await connect("single-flight", 0);
+    await connect("single-flight", 0);
     await testEnv.CODEX_UPSTREAM.blockRefresh();
 
-    const requests = Array.from({ length: 20 }, () => stub.infer(inferenceRequest()));
+    const requests = Array.from({ length: 20 }, () =>
+      testEnv.CODEX_RELAY.infer("single-flight", inferenceRequest()),
+    );
     await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
     await testEnv.CODEX_UPSTREAM.releaseRefresh();
 
     const responses = await Promise.all(requests);
     expect(responses.every((response) => response.status === 200)).toBe(true);
+    await Promise.all(responses.map((response) => response.arrayBuffer()));
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
   });
 
@@ -132,13 +161,137 @@ describe("Codex relay in Workerd", () => {
     await abortAllDurableObjects();
     stub = testEnv.CODEX_AUTH.getByName("interrupted-marker");
     await expect(stub.status()).resolves.toMatchObject({
-      state: "credential-state-unknown",
+      state: "reauth-required",
       reason: "interrupted_refresh",
     });
-    await expect(stub.infer(inferenceRequest()).then((response) => response.status)).resolves.toBe(
-      503,
-    );
+    await expect(
+      statusAfterConsume(testEnv.CODEX_RELAY.infer("interrupted-marker", inferenceRequest())),
+    ).resolves.toBe(401);
     expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(0);
+  });
+
+  it.each(["malformed", "server-error"] as const)(
+    "makes a %s authorization-code exchange outcome terminal without re-exchange",
+    async (mode) => {
+      const name = `exchange-${mode}`;
+      await testEnv.CODEX_UPSTREAM.setExchangeMode(mode);
+      const stub = testEnv.CODEX_AUTH.getByName(name);
+      const authorization = await testEnv.CODEX_RELAY.startLogin(name);
+      await forcePollDue(stub);
+
+      await expect(testEnv.CODEX_RELAY.pollLogin(name, authorization.attemptId)).resolves.toEqual({
+        state: "superseded",
+      });
+      await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+        state: "reauth-required",
+        reason: "authorization_code_exchange_failed",
+      });
+      await expect(testEnv.CODEX_RELAY.pollLogin(name, authorization.attemptId)).resolves.toEqual({
+        state: "superseded",
+      });
+      expect((await testEnv.CODEX_UPSTREAM.read()).exchangeCalls).toBe(1);
+    },
+  );
+
+  it("keeps the durable reconnect marker when initial credential encryption fails", async () => {
+    const name = "exchange-encryption-fault";
+    const stub = testEnv.CODEX_AUTH.getByName(name);
+    const authorization = await testEnv.CODEX_RELAY.startLogin(name);
+    await forcePollDue(stub);
+
+    await runInDurableObject(stub, async (instance) => {
+      const encrypt = vi
+        .spyOn(crypto.subtle, "encrypt")
+        .mockRejectedValueOnce(new Error("fake encryption fault"));
+      try {
+        await expect(instance.pollLogin(authorization.attemptId)).resolves.toEqual({
+          state: "superseded",
+        });
+      } finally {
+        encrypt.mockRestore();
+      }
+    });
+
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+      state: "reauth-required",
+      reason: "credential_encryption_failed",
+    });
+    expect((await testEnv.CODEX_UPSTREAM.read()).exchangeCalls).toBe(1);
+  });
+
+  it("keeps the durable reconnect marker when the initial ready-state commit fails", async () => {
+    const name = "exchange-commit-fault";
+    const stub = testEnv.CODEX_AUTH.getByName(name);
+    const authorization = await testEnv.CODEX_RELAY.startLogin(name);
+    await forcePollDue(stub);
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const storage = state.storage as unknown as {
+        put(key: string, value: unknown): Promise<void>;
+      };
+      const originalPut = storage.put.bind(storage);
+      const put = vi.spyOn(storage, "put").mockImplementation(async (key, value) => {
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          "state" in value &&
+          value.state === "ready"
+        ) {
+          throw new Error("fake ready commit fault");
+        }
+        await originalPut(key, value);
+      });
+      try {
+        await expect(instance.pollLogin(authorization.attemptId)).resolves.toEqual({
+          state: "superseded",
+        });
+      } finally {
+        put.mockRestore();
+      }
+    });
+
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+      state: "reauth-required",
+      reason: "credential_commit_failed",
+    });
+    expect((await testEnv.CODEX_UPSTREAM.read()).exchangeCalls).toBe(1);
+  });
+
+  it("requires reauthentication after an ambiguous refresh provider outcome", async () => {
+    const name = "ambiguous-refresh";
+    await connect(name, 0);
+    await testEnv.CODEX_UPSTREAM.setRefreshMode("server-error");
+
+    await expect(
+      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+    ).resolves.toBe(401);
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+      state: "reauth-required",
+      reason: "ambiguous_refresh",
+    });
+  });
+
+  it("reserves credential-state-unknown for local credential corruption", async () => {
+    const name = "credential-corruption";
+    const stub = await connect(name);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const stored = await state.storage.get<{
+        credential: { ciphertext: string };
+      }>(STATE_KEY);
+      if (!stored) throw new Error("Missing ready fake state");
+      await state.storage.put(STATE_KEY, {
+        ...stored,
+        credential: { ...stored.credential, ciphertext: `${stored.credential.ciphertext}A` },
+      });
+    });
+
+    await expect(
+      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+    ).resolves.toBe(503);
+    await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
+      state: "credential-state-unknown",
+      reason: "credential_decryption_failed",
+    });
   });
 
   it("disconnect erases ciphertext and rotates the connection epoch", async () => {
@@ -155,9 +308,9 @@ describe("Codex relay in Workerd", () => {
   });
 
   it("refreshes and retries exactly once on a pre-stream 401", async () => {
-    const stub = await connect("retry-once");
+    await connect("retry-once");
     await testEnv.CODEX_UPSTREAM.rejectNextInferenceAsUnauthorized();
-    const response = await stub.infer(inferenceRequest());
+    const response = await testEnv.CODEX_RELAY.infer("retry-once", inferenceRequest());
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(response.headers.get("x-request-id")).toBe("request-workerd-fake-2");
@@ -166,15 +319,60 @@ describe("Codex relay in Workerd", () => {
     expect(upstream.lastInferenceHeaders.authorization).not.toBe("Bearer caller-must-not-cross");
     expect(upstream.lastInferenceHeaders.cookie).toBeUndefined();
     expect(upstream.lastInferenceHeaders["chatgpt-account-id"]).toBe("account_workerd_fake");
+    await response.arrayBuffer();
+  });
+
+  it("validates Pi zstd input with decompression bounds and forwards normalized identity JSON", async () => {
+    await connect("zstd-input");
+    const response = await testEnv.CODEX_RELAY.infer(
+      "zstd-input",
+      await zstdInferenceRequest({
+        model: "gpt-5.6-sol",
+        stream: true,
+        input: [{ role: "user", content: [{ type: "input_text", text: "fake zstd prompt" }] }],
+      }),
+    );
+    expect(response.status).toBe(200);
+    const upstream = await testEnv.CODEX_UPSTREAM.read();
+    expect(upstream.lastInferenceHeaders["content-encoding"]).toBeUndefined();
+    expect(upstream.lastInferenceBody).toContain("fake zstd prompt");
+    await expect(response.text()).resolves.toContain("fake-complete");
+
+    const oversized = await zstdInferenceRequest({
+      model: "gpt-5.6-sol",
+      stream: true,
+      input: "x".repeat(MAX_INFERENCE_BODY_BYTES + 1),
+    });
+    await expect(
+      testEnv.CODEX_RELAY.infer("zstd-bomb", oversized).then(async (result) => ({
+        status: result.status,
+        body: await result.json(),
+      })),
+    ).resolves.toMatchObject({
+      status: 413,
+      body: { error: { code: "request_too_large" } },
+    });
   });
 
   it("returns an open upstream stream without buffering and permits downstream cancellation", async () => {
-    const stub = await connect("stream-cancel");
+    await connect("stream-cancel");
     await testEnv.CODEX_UPSTREAM.setStreamMode("cancellable");
-    const response = await stub.infer(inferenceRequest());
+    const abort = new AbortController();
+    const response = await testEnv.CODEX_RELAY.infer(
+      "stream-cancel",
+      inferenceRequest(abort.signal),
+    );
     const reader = response.body?.getReader();
     expect(await reader?.read()).toMatchObject({ done: false });
     await reader?.cancel();
+    abort.abort("fake downstream cancellation");
+    await Promise.race([
+      testEnv.CODEX_UPSTREAM.waitForStreamCancellation(),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("Timed out waiting for upstream cancellation")), 1_000),
+      ),
+    ]);
+    expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(1);
   });
 
   it("keeps the public Worker dark and exposes management only over RPC", async () => {

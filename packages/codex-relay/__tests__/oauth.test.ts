@@ -3,6 +3,7 @@ import {
   OAuthProtocolError,
   accountIdFromAccessToken,
   createFetchAdapter,
+  exchangeDeviceCode,
   pollDeviceAuthorization,
   refreshCodexCredential,
   startDeviceAuthorization,
@@ -63,7 +64,7 @@ describe("portable Codex OAuth", () => {
     });
   });
 
-  it("classifies provider pending and denial responses", async () => {
+  it("classifies provider pending, denial, and expiry responses before status fallbacks", async () => {
     const pendingFetch = vi
       .fn<typeof fetch>()
       .mockResolvedValue(new Response(null, { status: 403 }));
@@ -77,6 +78,50 @@ describe("portable Codex OAuth", () => {
     await expect(pollDeviceAuthorization("device_fake", "FAKE", deniedFetch)).resolves.toEqual({
       state: "denied",
     });
+
+    const denied403 = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ error: "access_denied" }, { status: 403 }));
+    await expect(pollDeviceAuthorization("device_fake", "FAKE", denied403)).resolves.toEqual({
+      state: "denied",
+    });
+
+    const expired404 = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ error: "device_code_expired" }, { status: 404 }));
+    await expect(pollDeviceAuthorization("device_fake", "FAKE", expired404)).resolves.toEqual({
+      state: "expired",
+    });
+  });
+
+  it("retries only a provably pre-dispatch exchange failure", async () => {
+    const synchronousFailure = (() => {
+      throw new Error("fake request construction failure");
+    }) as typeof fetch;
+    const error = await exchangeDeviceCode(
+      "code_fake",
+      "verifier_fake",
+      0,
+      synchronousFailure,
+    ).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ kind: "transient" });
+  });
+
+  it.each([
+    ["post-dispatch reset", vi.fn<typeof fetch>().mockRejectedValue(new Error("fake reset"))],
+    [
+      "nondefinitive provider response",
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 503 })),
+    ],
+    [
+      "malformed success",
+      vi.fn<typeof fetch>().mockResolvedValue(Response.json({ access_token: fakeJwt() })),
+    ],
+  ])("classifies %s during authorization-code exchange as ambiguous", async (_name, fakeFetch) => {
+    const error = await exchangeDeviceCode("code_fake", "verifier_fake", 0, fakeFetch).catch(
+      (cause: unknown) => cause,
+    );
+    expect(error).toMatchObject({ kind: "ambiguous" });
   });
 
   it("accepts only a complete rotated refresh credential", async () => {

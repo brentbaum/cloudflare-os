@@ -175,16 +175,25 @@ export async function pollDeviceAuthorization(
     throw new OAuthProtocolError("transient", "Device authorization poll failed temporarily");
   }
 
-  if (response.status === 403 || response.status === 404) return { state: "pending" };
   const body = await responseBody(response);
   const code = errorCode(body);
   if (response.status === 429 || code === "slow_down") {
     return { state: "pending", retryAfterMs: parseRetryAfterMs(response) };
   }
-  if (response.status === 410 || code === "expired_token" || code === "expired")
+  if (
+    response.status === 410 ||
+    code === "expired_token" ||
+    code === "expired" ||
+    code === "device_code_expired" ||
+    code === "device_authorization_expired"
+  )
     return { state: "expired" };
   if (code === "access_denied" || code === "authorization_declined") return { state: "denied" };
   if (code === "authorization_pending") return { state: "pending" };
+  // OpenAI currently uses bare 403/404 responses for the ordinary pending case. Inspect any
+  // structured terminal error first so access denial and device expiry can never be hidden by
+  // that compatibility behavior.
+  if (response.status === 403 || response.status === 404) return { state: "pending" };
   if (!response.ok) {
     throw new OAuthProtocolError(
       "transient",
@@ -242,9 +251,9 @@ export async function exchangeDeviceCode(
   now = Date.now(),
   fetchImpl: FetchImplementation = fetch,
 ): Promise<CodexCredential> {
-  let response: Response;
+  let responsePromise: Promise<Response>;
   try {
-    response = await fetchImpl(TOKEN_URL, {
+    responsePromise = fetchImpl(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -257,12 +266,24 @@ export async function exchangeDeviceCode(
       signal: requestSignal(),
     });
   } catch {
+    // A synchronous fetch throw proves the request was not dispatched. This is the only exchange
+    // failure for which retaining the one-time authorization code is safe.
     throw new OAuthProtocolError("transient", "OAuth token exchange failed temporarily");
   }
-  if (!response.ok) {
-    throw new OAuthProtocolError("transient", "OAuth token exchange was rejected", response.status);
+  let response: Response;
+  try {
+    response = await responsePromise;
+  } catch {
+    throw new OAuthProtocolError("ambiguous", "OAuth token exchange outcome is unknown");
   }
-  return parseCredential(response, now, "invalid-response");
+  if (!response.ok) {
+    throw new OAuthProtocolError(
+      "ambiguous",
+      "OAuth token exchange outcome is unknown",
+      response.status,
+    );
+  }
+  return parseCredential(response, now, "ambiguous");
 }
 
 /** Refresh a rotating Codex credential, classifying post-send uncertainty as ambiguous. */

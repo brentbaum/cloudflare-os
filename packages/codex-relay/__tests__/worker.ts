@@ -4,8 +4,11 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 export { CodexAuth, CodexRelay, default } from "../src/index.js";
 
 type StreamMode = "complete" | "cancellable";
+type ExchangeMode = "success" | "malformed" | "server-error";
+type RefreshMode = "success" | "server-error";
 
 let initialExpiresIn = 3600;
+let exchangeCalls = 0;
 let refreshCalls = 0;
 let inferenceCalls = 0;
 let streamMode: StreamMode = "complete";
@@ -14,6 +17,9 @@ let unauthorizedOnce = false;
 let refreshGate: Promise<void> | undefined;
 let releaseRefreshGate: (() => void) | undefined;
 let lastInferenceHeaders: Record<string, string> = {};
+let lastInferenceBody = "";
+let exchangeMode: ExchangeMode = "success";
+let refreshMode: RefreshMode = "success";
 
 function fakeJwt(accountId: string, generation: number): string {
   const payload = btoa(
@@ -57,24 +63,52 @@ export class TestUpstream extends WorkerEntrypoint {
       if (form.get("grant_type") === "refresh_token") {
         refreshCalls++;
         await refreshGate;
+        if (refreshMode === "server-error")
+          return Response.json({ error: "server_error_fake" }, { status: 503 });
         return Response.json(fakeCredential(refreshCalls + 1, 3600));
       }
+      exchangeCalls++;
+      if (exchangeMode === "malformed") return Response.json({ access_token: "malformed_fake" });
+      if (exchangeMode === "server-error")
+        return Response.json({ error: "server_error_fake" }, { status: 503 });
       return Response.json(fakeCredential(1, initialExpiresIn));
     }
     if (url.pathname === "/backend-api/codex/responses") {
       inferenceCalls++;
       lastInferenceHeaders = Object.fromEntries(request.headers);
+      lastInferenceBody = await request.clone().text();
       if (unauthorizedOnce) {
         unauthorizedOnce = false;
         return Response.json({ error: "fake_unauthorized" }, { status: 401 });
       }
-      if (streamMode === "cancellable") {
+      if (streamMode !== "complete") {
+        let first = true;
+        let heartbeat: ReturnType<typeof setTimeout> | undefined;
+        let cancellationObserved = false;
+        const observeCancellation = () => {
+          if (cancellationObserved) return;
+          cancellationObserved = true;
+          streamCancellations++;
+        };
+        request.signal.addEventListener("abort", observeCancellation, { once: true });
         const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode("data: fake-first-chunk\n\n"));
+          async pull(controller) {
+            if (first) {
+              first = false;
+              controller.enqueue(new TextEncoder().encode("data: fake-first-chunk\n\n"));
+              return;
+            }
+            await new Promise<void>((resolve) => {
+              heartbeat = setTimeout(() => {
+                heartbeat = undefined;
+                controller.enqueue(new TextEncoder().encode(": fake-heartbeat\n\n"));
+                resolve();
+              }, 10);
+            });
           },
           cancel() {
-            streamCancellations++;
+            if (heartbeat) clearTimeout(heartbeat);
+            observeCancellation();
           },
         });
         return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
@@ -93,6 +127,7 @@ export class TestUpstream extends WorkerEntrypoint {
   reset(): void {
     releaseRefreshGate?.();
     initialExpiresIn = 3600;
+    exchangeCalls = 0;
     refreshCalls = 0;
     inferenceCalls = 0;
     streamMode = "complete";
@@ -101,10 +136,21 @@ export class TestUpstream extends WorkerEntrypoint {
     refreshGate = undefined;
     releaseRefreshGate = undefined;
     lastInferenceHeaders = {};
+    lastInferenceBody = "";
+    exchangeMode = "success";
+    refreshMode = "success";
   }
 
   setInitialExpiresIn(seconds: number): void {
     initialExpiresIn = seconds;
+  }
+
+  setExchangeMode(mode: ExchangeMode): void {
+    exchangeMode = mode;
+  }
+
+  setRefreshMode(mode: RefreshMode): void {
+    refreshMode = mode;
   }
 
   blockRefresh(): void {
@@ -138,11 +184,20 @@ export class TestUpstream extends WorkerEntrypoint {
   }
 
   read(): {
+    exchangeCalls: number;
     refreshCalls: number;
     inferenceCalls: number;
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
+    lastInferenceBody: string;
   } {
-    return { refreshCalls, inferenceCalls, streamCancellations, lastInferenceHeaders };
+    return {
+      exchangeCalls,
+      refreshCalls,
+      inferenceCalls,
+      streamCancellations,
+      lastInferenceHeaders,
+      lastInferenceBody,
+    };
   }
 }

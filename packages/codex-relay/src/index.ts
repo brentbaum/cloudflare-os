@@ -7,6 +7,7 @@ import type {
   CodexRelayContract,
   CodexRelayStatus,
 } from "@gadgets/workshop-shared/codex-relay";
+import { sanitizeUpstreamResponse } from "./policy.js";
 import { CodexAuth } from "./vault.js";
 
 /** Service-binding RPC entrypoint for subscription-backed Codex inference. */
@@ -40,8 +41,11 @@ export class CodexRelay extends WorkerEntrypoint<Cloudflare.Env> implements Code
 
   /** Relay one fixed-policy Codex Responses request. */
   @skipRpcValidation()
-  infer(connection: CodexConnectionKey, request: Request): Promise<Response> {
-    return this.#connection(connection).infer(request);
+  async infer(connection: CodexConnectionKey, request: Request): Promise<Response> {
+    const response = await this.#connection(connection).infer(request);
+    // Materialize a stream edge at each RPC hop so downstream cancellation reaches the DO-owned
+    // upstream reader rather than only releasing the outer capability proxy.
+    return sanitizeUpstreamResponse(response);
   }
 }
 

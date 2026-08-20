@@ -33,16 +33,24 @@ async function importKey(encoded: string): Promise<KeySlot> {
   return { id, key };
 }
 
-function additionalData(objectId: string, purpose: string): Uint8Array<ArrayBuffer> {
+function additionalData(
+  objectId: string,
+  stateVersion: number,
+  purpose: string,
+): Uint8Array<ArrayBuffer> {
   const encoded = new TextEncoder().encode(
-    `${objectId}:codex-relay-state-v${ENVELOPE_VERSION}:${purpose}`,
+    `${objectId}:codex-relay-envelope-v${ENVELOPE_VERSION}:state-v${stateVersion}:${purpose}`,
   );
   const copy = new Uint8Array(new ArrayBuffer(encoded.byteLength));
   copy.set(encoded);
   return copy;
 }
 
-/** AES-GCM wrapping keys with one current key and an optional previous decryption key. */
+/**
+ * AES-GCM wrapping keys with one current encryption key and an optional previous decrypt-only key.
+ * During rotation, deploy both keys until every live connection has been refreshed/reconnected and
+ * rewritten with the current key; only then remove the previous key.
+ */
 export class WrappingKeyring {
   private constructor(
     private readonly current: KeySlot,
@@ -56,11 +64,16 @@ export class WrappingKeyring {
     return new WrappingKeyring(currentKey, previousKey);
   }
 
-  async encrypt(value: unknown, objectId: string, purpose: string): Promise<EncryptedEnvelope> {
+  async encrypt(
+    value: unknown,
+    objectId: string,
+    stateVersion: number,
+    purpose: string,
+  ): Promise<EncryptedEnvelope> {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const plaintext = new TextEncoder().encode(JSON.stringify(value));
     const ciphertext = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv, additionalData: additionalData(objectId, purpose) },
+      { name: "AES-GCM", iv, additionalData: additionalData(objectId, stateVersion, purpose) },
       this.current.key,
       plaintext,
     );
@@ -72,7 +85,12 @@ export class WrappingKeyring {
     };
   }
 
-  async decrypt<T>(envelope: EncryptedEnvelope, objectId: string, purpose: string): Promise<T> {
+  async decrypt<T>(
+    envelope: EncryptedEnvelope,
+    objectId: string,
+    stateVersion: number,
+    purpose: string,
+  ): Promise<T> {
     if (envelope.version !== ENVELOPE_VERSION)
       throw new Error("Unsupported encrypted state version");
     const slot = [this.current, this.previous].find(
@@ -84,7 +102,7 @@ export class WrappingKeyring {
         {
           name: "AES-GCM",
           iv: decodeBase64(envelope.iv),
-          additionalData: additionalData(objectId, purpose),
+          additionalData: additionalData(objectId, stateVersion, purpose),
         },
         slot.key,
         decodeBase64(envelope.ciphertext),

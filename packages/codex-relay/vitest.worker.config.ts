@@ -10,6 +10,7 @@ export default defineConfig({
       main: "./__tests__/worker.ts",
       miniflare: {
         compatibilityDate: "2026-02-02",
+        compatibilityFlags: ["nodejs_compat", "enable_request_signal", "enable_abortsignal_rpc"],
         bindings: {
           CODEX_WRAPPING_KEY_CURRENT: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         },

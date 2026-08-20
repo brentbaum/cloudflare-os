@@ -33,3 +33,18 @@ For local development, put `CODEX_WRAPPING_KEY_CURRENT` in the gitignored
 `packages/codex-relay/.dev.vars`, then start the normal dev server with
 `CODEX_SUBSCRIPTION_ENABLED=true`. The dev script starts and binds the relay only in that explicit
 mode; it never binds the router. Do not reuse a production refresh token in local development.
+
+## Wrapping-key rotation
+
+`CODEX_WRAPPING_KEY_CURRENT` must be a base64-encoded 32-byte AES key. To rotate it without making
+existing encrypted Durable Object state unreadable:
+
+1. Move the old current value to `CODEX_WRAPPING_KEY_PREVIOUS`, set a newly generated value as
+   `CODEX_WRAPPING_KEY_CURRENT`, and deploy both secrets together.
+2. Reconnect each active Codex connection (or allow its credential to refresh) so its state is
+   encrypted with the new current key. The previous key is decrypt-only; new state never uses it.
+3. Remove `CODEX_WRAPPING_KEY_PREVIOUS` only after no live state still depends on it. Removing it
+   early intentionally fails closed and requires affected users to reconnect.
+
+Run `pnpm --filter @gadgets/codex-relay types:check` in CI to ensure the type artifact generated
+from `wrangler.private.jsonc` has not drifted.
