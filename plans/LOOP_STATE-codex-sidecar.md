@@ -29,12 +29,13 @@
 
 ## Current Slice
 
-Wave 3: deploy the fake-only preview, run the public negative probe and teardown, then perform one canonical production device login and canary. Local implementation and validation are complete; `wrangler whoami` reports expired authentication.
+Wave 3: deploy the fake-only preview, run the public negative probe and teardown, then perform one canonical production device login and canary. Local implementation, independent review, validation, and publication to the fork are complete. `wrangler whoami` still reports expired authentication, the shell has no `CLOUDFLARE_API_TOKEN`, and the fork currently has no Actions secrets or variables, so neither the local nor trusted-CI deployment path has authority yet.
 
 ## Done With Evidence
 
 - Goal recorded in the Codex task with no token budget cap.
 - Fork created: `https://github.com/brentbaum/cloudflare-os`.
+- Clean branch `feat-codex-subscription-sidecar` published to the fork at `c7689aa14507267d5fcc813aae9aa5073e5a47f7`; upstream push remains disabled.
 - Integration worktree created from the pinned upstream commit.
 - Upstream push disabled locally to prevent accidental writes to `cloudflare/cloudflare-os`.
 - Engineering plan copied into the fork.
@@ -60,10 +61,12 @@ Wave 3: deploy the fake-only preview, run the public negative probe and teardown
 - Local performance proxies run 100 warmed first-byte samples at p95 <=250 ms, abort-to-upstream cancellation under 500 ms, and real 1 MB/50 MB raw transfers without full-body materialization. Actual Worker queue depth/RSS and regional measurements remain preview gates.
 - The fork preview workflow explicitly trusts only `cloudflare` and `brentbaum` repository owners while retaining same-repo PR, maintainer association, non-bot, safe-trigger, and live write-permission checks.
 - The preview generator creates 20 configs in four tiers: fake upstream, private relay, backend, and public router. Only the backend binds the relay; the router never does. Hosted one-click release intentionally excludes the private role until the external renderer learns it.
+- The post-completion critic and subsequent independent checker loops closed every locally actionable Critical/Important finding. The remaining findings are the explicitly deployed-only preview and live-canary gates.
 
 ## Open Questions / External Gates
 
 - Renew Wrangler authentication (or provide `CLOUDFLARE_API_TOKEN`) so the fake-only preview can be deployed, probed, and deleted.
+- Alternatively configure the fork's trusted preview workflow. It currently has no Actions secrets or repository variables, so opening a pull request would fail closed rather than deploy.
 - After preview passes, a deployment administrator must approve one OpenAI device login into the canonical production `shared-v1` owner for the controlled canary.
 - Do not create a second real credential owner for staging or preview; rotating refresh tokens make duplicated owners unsafe.
 
@@ -92,9 +95,9 @@ Wave 3: deploy the fake-only preview, run the public negative probe and teardown
 
 | Command/probe | Result | Notes |
 |---|---|---|
-| `git rev-parse HEAD` | pass | Implementation HEAD before ledger update: `b8ba8d4aec156c3acd5e365d17143bab5d38778d`; baseline is `dd2b015071fe21de49fe2a68b57ef966dde15877`. |
+| `git rev-parse HEAD` | pass | Published implementation and documentation HEAD before this ledger correction: `c7689aa14507267d5fcc813aae9aa5073e5a47f7`; baseline is `dd2b015071fe21de49fe2a68b57ef966dde15877`. |
 | `pnpm install --frozen-lockfile --offline` | pass | All 28 workspace projects are up to date; the pinned Pi patch resolves reproducibly. |
-| `pnpm test` | pass | 148 root script tests plus every workspace package suite; backend reports 349 unit, 2 Workerd integration pass/4 existing skips, and the dedicated sidecar lifecycle pass. |
+| `pnpm test` | pass | 152 root script tests plus every workspace package suite; backend reports 349 unit, 2 Workerd integration pass/4 existing skips, and the dedicated sidecar lifecycle pass. |
 | `pnpm lint` | pass | Existing unrelated warnings only; new code has no lint errors. |
 | `pnpm build` | pass | Full recursive workspace build completes, including relay, backend Worker, frontend, and shared types. |
 | Pi 0.83 injected-fetch probe | pass | `StreamOptions.fetch` exists and Codex SSE uses it; no fetch patch required. |
@@ -107,10 +110,11 @@ Wave 3: deploy the fake-only preview, run the public negative probe and teardown
 | `pnpm --filter @gadgets/workshop-frontend test:run` | pass | 193 tests; existing jsdom scroll warning only. |
 | `node --test scripts/preview/staging-config.test.ts scripts/env-passthrough.test.ts` | pass | Private relay/fake topology, safe vars, signal flags, and preview key handling. |
 | `node --test scripts/release/manifest-lib.test.ts` | pass | 5 tests; current hosted manifest remains stable and explicitly excludes private relay. |
-| preview `config`, `deploy --dry-run`, and `delete --dry-run` with fake values | pass | 20 configs; four-tier deployment, only router public, dependent-first teardown. |
+| preview `config`, `deploy --dry-run`, and `delete --dry-run` with fake values | pass | Revalidated at published HEAD with fake-only values: 20 configs; four-tier deployment, only router public, dependent-first teardown. |
 | local performance proxy | pass | 100 warmed first-byte samples p95 <=250 ms; abort-to-cancel <500 ms; 1 MB/50 MB raw transfer and no full materialization. |
 | relay `wrangler deploy -c wrangler.private.jsonc --dry-run` | pass | Private Worker bundle, Durable Object migration, and RPC exports build successfully. |
-| `wrangler whoami` | blocked externally | Stored Cloudflare authentication is expired and non-interactive refresh failed; no deployment was attempted. |
+| `wrangler whoami` | blocked externally | Rechecked after publication: stored Cloudflare authentication is expired, non-interactive refresh failed, and no environment token is present; no deployment was attempted. |
+| fork Actions configuration | blocked externally | GitHub CLI authentication works, but `gh secret list` and `gh variable list` return no configured entries for `brentbaum/cloudflare-os`; the trusted preview workflow therefore has no alternate authority path yet. |
 | changed-file secret-pattern scan | pass | Matches occur only in obvious fake upstream/test fixtures; no real credential source was read. |
 | `git diff --check dd2b015` | pass | No whitespace or conflict-marker errors. |
 
@@ -128,7 +132,6 @@ Wave 3: deploy the fake-only preview, run the public negative probe and teardown
 
 ## Next Action
 
-1. Complete the mandatory post-completion critic pass and address any Critical/Important finding.
-2. Push the clean implementation branch to `brentbaum/cloudflare-os`.
-3. Renew Cloudflare authentication, deploy the fake-only preview, verify private negative reachability and end-to-end fake login/stream/cancel/disconnect, then delete it.
-4. With explicit administrator participation, deploy disabled first, enable the feature, perform one canonical device login, run the production canary, disconnect, and complete the final secret/log scan.
+1. Renew Cloudflare authentication locally, or configure the fork's trusted preview secrets and variables.
+2. Deploy the fake-only preview, verify private negative reachability and end-to-end fake login/stream/cancel/disconnect, collect deployed latency/memory evidence, then delete it.
+3. With explicit administrator participation, deploy disabled first, enable the feature, perform one canonical device login, run the production canary, disconnect, and complete the final secret/log scan.
