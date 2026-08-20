@@ -11,17 +11,21 @@ import type { BindingDecl } from "../release/manifest-lib.ts";
 import {
   MAX_PREVIEW_NAME_LENGTH,
   R2_MAX_BUCKET_NAME_LENGTH,
+  assertNamedResourceScope,
   backendSecrets,
   buildPreviewConfigs,
   codexRelaySecrets,
   gatekeeperBindingName,
   gatekeeperShortName,
   isGatekeeper,
+  namedAutoResources,
+  namedWorkerName,
   previewPullRequestNumber,
   readPackages,
   resolveAccess,
   resolveAiGateway,
   resolvePreviewName,
+  resolvePreviewDeployMode,
   resolveTarget,
   routerPreviewUrl,
   slugifyPreviewName,
@@ -97,16 +101,25 @@ function previewsOf(configs: Map<string, StagingConfig>, name: string): PreviewO
   return config.previews;
 }
 
-function buildAll() {
+function buildAll(deployMode: "preview" | "named" = "preview") {
   const packages = readPackages();
   const configs = buildPreviewConfigs({
     previewName: PREVIEW_NAME,
     packages,
     accountId: ACCOUNT_ID,
     workersDevHost: WORKERS_DEV_HOST,
+    deployMode,
   });
   return { packages, configs };
 }
+
+test("named mode is explicit and Worker Previews remain the default", () => {
+  assert.equal(resolvePreviewDeployMode({ mode: undefined }), "preview");
+  assert.equal(resolvePreviewDeployMode({ mode: "preview" }), "preview");
+  assert.equal(resolvePreviewDeployMode({ mode: " named " }), "named");
+  assert.throws(() => resolvePreviewDeployMode({ mode: "auto" }),
+      /PREVIEW_DEPLOY_MODE must be/);
+});
 
 test("preview names are slugified", () => {
   assert.equal(slugifyPreviewName("pr-123"), "pr-123");
@@ -218,6 +231,57 @@ test("the router is the only worker with a public hostname", () => {
     assert.equal(config.workers_dev, exposed, `${name}: workers_dev`);
     assert.equal(config.preview_urls, exposed, `${name}: preview_urls`);
   }
+});
+
+test("named fallback creates ordinary unique Workers and exposes only its router", () => {
+  const { packages, configs } = buildAll("named");
+
+  for (const { name } of packages) {
+    const config = configs.get(name);
+    assert.ok(config, name);
+    assert.equal(config.name, namedWorkerName(PREVIEW_NAME, name));
+    assert.equal(config.previews, undefined, `${name}: named config retains beta preview settings`);
+    assert.equal(config.workers_dev, name === "router", `${name}: workers_dev`);
+    assert.equal(config.preview_urls, name === "router", `${name}: preview_urls`);
+  }
+});
+
+test("named fallback rewrites every ordinary service binding to its unique sibling", () => {
+  const { packages, configs } = buildAll("named");
+  const packageNames = new Set(packages.map(({ name }) => name));
+
+  for (const [name, config] of configs) {
+    for (const service of config.services ?? []) {
+      const prefix = `${PREVIEW_NAME}-`;
+      assert.ok(service.service.startsWith(prefix), `${name}: ${service.service}`);
+      assert.ok(packageNames.has(service.service.slice(prefix.length)),
+          `${name}: binding escaped this instance: ${service.service}`);
+      assert.equal((service as { preview_id?: string }).preview_id, undefined);
+    }
+  }
+  assert.deepEqual(configs.get("codex-relay")?.services, [{
+    binding: "CODEX_UPSTREAM",
+    service: `${PREVIEW_NAME}-codex-fake-upstream`,
+  }]);
+});
+
+test("named cleanup owns only exact deterministic binding resource names", () => {
+  const resources = namedAutoResources(buildAll("named").configs);
+  assert.deepEqual(resources.map(({ kind, name }) => [kind, name]).toSorted(), [
+    ["kv", `${PREVIEW_NAME}-gatekeeper-context-context-collections`],
+    ["kv", `${PREVIEW_NAME}-workshop-backend-avatars`],
+    ["kv", `${PREVIEW_NAME}-workshop-backend-blueprints`],
+    ["r2", `${PREVIEW_NAME}-workshop-backend-blueprint-content`],
+  ].toSorted());
+  assert.ok(resources.every(({ name }) => name.startsWith(`${PREVIEW_NAME}-`)));
+  assert.ok(!resources.some(({ name }) => name === "moltbot-data" || name === "captains-log"));
+  assert.doesNotThrow(() => assertNamedResourceScope(PREVIEW_NAME, resources));
+  assert.throws(() => assertNamedResourceScope(PREVIEW_NAME, [{
+    kind: "r2",
+    worker: `${PREVIEW_NAME}-workshop-backend`,
+    binding: "BLUEPRINT_CONTENT",
+    name: "moltbot-data",
+  }]), /refusing to delete out-of-scope r2 resource moltbot-data/);
 });
 
 test("the backend's per-preview resources carry no ids, so wrangler provisions them", () => {

@@ -106,6 +106,17 @@ export interface DeployablePackage extends PackageConfig {
   dir: string;
 }
 
+/** How a disposable instance is represented on Cloudflare. */
+export type PreviewDeployMode = "preview" | "named";
+
+/** An account resource Wrangler auto-provisions for one named disposable Worker. */
+export interface NamedAutoResource {
+  kind: "kv" | "r2" | "d1";
+  name: string;
+  worker: string;
+  binding: string;
+}
+
 /** The values every `apply*` function derives its config from. */
 interface PreviewContext {
   /** The preview's public origin: the router preview's workers.dev URL. */
@@ -141,6 +152,31 @@ const PREVIEW_NAME_HASH_LENGTH = 8;
 const GATEKEEPER_PREFIX = "gatekeeper-";
 const CODEX_RELAY_NAME = "codex-relay";
 const CODEX_FAKE_UPSTREAM_NAME = "codex-fake-upstream";
+
+/**
+ * Worker Previews remain the default. `named` is an explicit compatibility fallback for accounts
+ * where the Worker Previews API returns 10015: each package becomes an ordinary, uniquely named
+ * Worker instead.
+ */
+export function resolvePreviewDeployMode({
+  mode = process.env.PREVIEW_DEPLOY_MODE,
+}: { mode?: string } = {}): PreviewDeployMode {
+  const normalized = mode?.trim() || "preview";
+  if (normalized !== "preview" && normalized !== "named") {
+    throw new Error(`PREVIEW_DEPLOY_MODE must be "preview" or "named", not "${mode}"`);
+  }
+  return normalized;
+}
+
+/** The collision-resistant ordinary Worker name used by named fallback mode. */
+export function namedWorkerName(previewName: string, packageName: string): string {
+  return `${previewName}-${packageName}`;
+}
+
+/** Wrangler's deterministic name for a binding-only resource on an ordinary Worker. */
+export function namedResourceName(workerName: string, binding: string): string {
+  return `${workerName}-${binding.toLowerCase().replaceAll("_", "-")}`;
+}
 
 /** True for the packages that are gatekeeper workers (as opposed to the router and backend). */
 export function isGatekeeper(pkgName: string): boolean {
@@ -439,11 +475,13 @@ export function buildPreviewConfigs({
   packages,
   accountId,
   workersDevHost,
+  deployMode = "preview",
 }: {
   previewName: string;
   packages: readonly PackageConfig[];
   accountId: string;
   workersDevHost: string;
+  deployMode?: PreviewDeployMode;
 }): Map<string, StagingConfig> {
   if (!accountId || !workersDevHost) {
     throw new Error("buildPreviewConfigs needs both accountId and workersDevHost");
@@ -490,11 +528,77 @@ export function buildPreviewConfigs({
     }
     else throw new Error(`cannot build a preview config for package: ${pkg.name}`);
 
+    if (deployMode === "named") {
+      // A normal deploy reads top-level bindings, not `previews`. Give every ordinary service
+      // binding the unique sibling Worker name up front, so no preview-id patching is involved.
+      config.name = namedWorkerName(previewName, pkg.name);
+      config.observability = previewObservability(config);
+      if (config.services) {
+        const packageNames = new Set(packages.map(({ name }) => name));
+        config.services = config.services.map((service) => {
+          if (!packageNames.has(service.service)) {
+            throw new Error(`${pkg.name} binds unknown worker ${service.service}; named preview ` +
+                "mode can only rewrite bindings to packages in this instance");
+          }
+          return { ...service, service: namedWorkerName(previewName, service.service) };
+        });
+      }
+      // Leaving this present would be harmless to `wrangler deploy`, but makes a generated named
+      // config dangerously ambiguous to a human (and usable by the wrong command).
+      delete config.previews;
+    }
+
     configs.set(pkg.name, config);
   }
 
   assertBucketNamesFit(configs);
   return configs;
+}
+
+/**
+ * Exact external resource names named-mode cleanup owns. These are derived from the generated
+ * configs rather than discovered by a broad account prefix scan, so an unrelated namespace or
+ * bucket can never be selected for deletion.
+ */
+export function namedAutoResources(
+  configs: ReadonlyMap<string, StagingConfig>,
+): NamedAutoResource[] {
+  const resources: NamedAutoResource[] = [];
+  for (const config of configs.values()) {
+    if (!config.name) throw new Error("named resource cleanup encountered a worker with no name");
+    const groups: [NamedAutoResource["kind"], BindingDecl[] | undefined][] = [
+      ["kv", config.kv_namespaces],
+      ["r2", config.r2_buckets],
+      ["d1", config.d1_databases],
+    ];
+    for (const [kind, bindings] of groups) {
+      for (const { binding } of bindings ?? []) {
+        if (!binding) throw new Error(`${config.name} has a resource binding with no name`);
+        resources.push({
+          kind,
+          worker: config.name,
+          binding,
+          name: namedResourceName(config.name, binding),
+        });
+      }
+    }
+  }
+  return resources;
+}
+
+/** Fail before cleanup if any proposed deletion escapes this instance's exact name prefix. */
+export function assertNamedResourceScope(
+  previewName: string,
+  resources: readonly NamedAutoResource[],
+): void {
+  const prefix = `${previewName}-`;
+  for (const resource of resources) {
+    if (!resource.worker.startsWith(prefix) || !resource.name.startsWith(prefix) ||
+        resource.name !== namedResourceName(resource.worker, resource.binding)) {
+      throw new Error(`refusing to delete out-of-scope ${resource.kind} resource ${resource.name}; ` +
+          `named cleanup is limited to exact prefix ${prefix}`);
+    }
+  }
 }
 
 /**
@@ -504,9 +608,11 @@ export function buildPreviewConfigs({
  */
 function assertBucketNamesFit(configs: Map<string, StagingConfig>): void {
   for (const [pkgName, config] of configs) {
-    for (const { binding } of config.previews?.r2_buckets ?? []) {
+    for (const { binding } of config.previews?.r2_buckets ?? config.r2_buckets ?? []) {
       const suffix = binding.toLowerCase().replaceAll("_", "-");
-      const length = `${config.name}-`.length + MAX_PREVIEW_NAME_LENGTH + `-${suffix}`.length;
+      // The two modes order these labels differently (`worker-preview-binding` versus
+      // `preview-worker-binding`) but have the same total length.
+      const length = `${pkgName}-`.length + MAX_PREVIEW_NAME_LENGTH + `-${suffix}`.length;
       if (length <= R2_MAX_BUCKET_NAME_LENGTH) continue;
       throw new Error(`${pkgName}'s ${binding} bucket would be ${length} characters for a ` +
           `${MAX_PREVIEW_NAME_LENGTH}-character preview name, over R2's ` +
@@ -750,13 +856,16 @@ export function writePreviewConfig(pkgDir: string, config: StagingConfig): void 
  */
 export function generatePreviewConfigs(options: {
   previewName?: string;
+  deployMode?: PreviewDeployMode;
 } = {}): {
   previewName: string;
   workersDevHost: string;
   baseUrl: string;
   packages: DeployablePackage[];
+  configs: Map<string, StagingConfig>;
 } {
   const previewName = options.previewName ?? resolvePreviewName();
+  const deployMode = options.deployMode ?? resolvePreviewDeployMode();
   const { accountId, workersDevHost } = resolveTarget();
   const packages = readPackages();
   const configs = buildPreviewConfigs({
@@ -764,6 +873,7 @@ export function generatePreviewConfigs(options: {
     packages,
     accountId,
     workersDevHost,
+    deployMode,
   });
 
   for (const pkg of packages) {
@@ -779,6 +889,7 @@ export function generatePreviewConfigs(options: {
     workersDevHost,
     baseUrl: routerPreviewUrl(previewName, workersDevHost),
     packages,
+    configs,
   };
 }
 

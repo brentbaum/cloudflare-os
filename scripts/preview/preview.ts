@@ -39,16 +39,21 @@ import { spawn } from "node:child_process";
 import {
   ROOT,
   STAGING_CONFIG_NAME,
+  assertNamedResourceScope,
   backendSecrets,
   codexRelaySecrets,
   gatekeeperShortName,
   generatePreviewConfigs,
   isGatekeeper,
+  namedAutoResources,
   previewPullRequestNumber,
   previewUrlFor,
+  resolvePreviewDeployMode,
   resolvePreviewName,
   writePreviewConfig,
   type DeployablePackage,
+  type NamedAutoResource,
+  type PreviewDeployMode,
   type StagingConfig,
 } from "./staging-config.ts";
 
@@ -322,6 +327,22 @@ async function deployBaselineWorker(
   }
 }
 
+/** Deploy one uniquely named ordinary Worker. Its generated config already names every sibling. */
+async function deployNamedWorker(
+  pkg: DeployablePackage,
+  wranglerCommand: string,
+): Promise<void> {
+  const config = readConfig(pkg.dir);
+  console.log(`running in ${pkg.name}: wrangler deploy -c ${STAGING_CONFIG_NAME} ` +
+      `(ordinary worker ${config.name})`);
+  const result = await runWrangler(pkg, wranglerCommand, ["deploy", "-c", STAGING_CONFIG_NAME]);
+  writeCommandOutput(pkg, result);
+  if (result.status !== 0) {
+    throw new Error(`wrangler deploy failed for named worker ${config.name} with exit code ` +
+        `${result.status}`);
+  }
+}
+
 /**
  * Give a worker its secrets — the backend's admins and Cloudflare Access pair (see
  * backendSecrets). None of them is in the generated config, because Wrangler prints the values it
@@ -375,6 +396,19 @@ async function uploadPreviewSecrets(
   if (result.status !== 0) {
     throw new Error(`wrangler preview secret bulk failed for ${worker.name} with exit code ` +
         `${result.status}`);
+  }
+}
+
+/** Ordinary named Workers receive ordinary secrets, still serialized only onto stdin. */
+async function uploadNamedSecrets(
+  worker: DeployablePackage,
+  wranglerCommand: string,
+  secrets: Record<string, string>,
+): Promise<void> {
+  const result = await uploadSecrets(worker, wranglerCommand, secrets, { previews: false });
+  if (result.status !== 0) {
+    throw new Error(`wrangler secret bulk failed for named worker ${readConfig(worker.dir).name} ` +
+        `with exit code ${result.status}`);
   }
 }
 
@@ -439,6 +473,52 @@ async function deletePreview(
   }
   throw new Error(
       `wrangler preview delete failed for ${pkg.name} with exit code ${result.status}`);
+}
+
+async function deleteNamedWorker(
+  pkg: DeployablePackage,
+  wranglerCommand: string,
+): Promise<void> {
+  const workerName = readConfig(pkg.dir).name;
+  if (!workerName) throw new Error(`${pkg.name}'s generated named config has no worker name`);
+  console.log(`running in ${pkg.name}: wrangler delete ${workerName} ` +
+      `-c ${STAGING_CONFIG_NAME} --force`);
+  const result = await runWrangler(pkg, wranglerCommand,
+      ["delete", workerName, "-c", STAGING_CONFIG_NAME, "--force"]);
+  writeCommandOutput(pkg, result);
+  if (result.status === 0) return;
+  if (/not found|does not exist|10007/i.test(`${result.stdout}\n${result.stderr}`)) {
+    console.warn(`Named worker ${workerName} did not exist; continuing.`);
+    return;
+  }
+  throw new Error(`wrangler delete failed for named worker ${workerName} with exit code ` +
+      `${result.status}`);
+}
+
+async function deleteNamedWorkers(
+  workers: readonly DeployablePackage[],
+  wranglerCommand: string,
+): Promise<void> {
+  const failures: unknown[] = [];
+  const attempt = async (pkg: DeployablePackage) => {
+    try {
+      await deleteNamedWorker(pkg, wranglerCommand);
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+  const named = (name: string) => workers.filter((pkg) => pkg.name === name);
+  for (const pkg of [
+    ...named("router"), ...named("workshop-backend"), ...named("codex-relay"),
+  ]) await attempt(pkg);
+  await mapWithConcurrency(
+      workers.filter((pkg) =>
+        !["router", "workshop-backend", "codex-relay"].includes(pkg.name)),
+      GATEKEEPER_CONCURRENCY, attempt);
+  for (const failure of failures.slice(1)) {
+    console.error(`Additional failure deleting named worker: ${describe(failure)}`);
+  }
+  if (failures.length > 0) throw failures[0];
 }
 
 /**
@@ -538,9 +618,13 @@ function writePreviewComment(
   baseUrl: string,
   slug: string,
   accountId: string | undefined,
+  { deployMode = "preview", workerName = "router" }: {
+    deployMode?: PreviewDeployMode;
+    workerName?: string;
+  } = {},
 ): void {
   const dashboardUrl = `https://dash.cloudflare.com/${accountId}/workers/services/view/` +
-      `router/production/previews/${slug}`;
+      `${workerName}/production` + (deployMode === "preview" ? `/previews/${slug}` : "");
   // The slug is the PR number and the branch, so it is worth showing: it is the URL's first label.
   const comment = [
     `### Preview: \`${slug}\``,
@@ -582,29 +666,54 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
   // here rather than after twenty previews are live with whatever auth they defaulted to.
   const secrets = backendSecrets();
   const relaySecrets = codexRelaySecrets();
-  const { previewName, workersDevHost, baseUrl, packages } = generatePreviewConfigs();
+  const deployMode = resolvePreviewDeployMode();
+  const { previewName, workersDevHost, baseUrl, packages } =
+    generatePreviewConfigs({ deployMode });
   const { gatekeepers, codexFakeUpstream, codexRelay, backend, router } = tiers(packages);
 
   if (dryRun) {
-    console.log(`\ndry-run plan for preview "${previewName}" at ${baseUrl}:`);
+    console.log(`\ndry-run plan for ${deployMode === "named" ? "named fallback" : "preview"} ` +
+        `"${previewName}" at ${baseUrl}:`);
     console.log(`  tier 1 (${gatekeepers.length} gatekeepers + fake Codex upstream, concurrently):`);
     for (const pkg of gatekeepers) {
-      console.log(`    ${pkg.name} ` +
+      console.log(`    ${readConfig(pkg.dir).name} ` +
           `(no hostname; served at ${baseUrl}/gatekeeper/${gatekeeperShortName(pkg.name)})`);
     }
-    console.log(`    ${codexFakeUpstream.name} (no hostname; fake data only)`);
-    console.log(`  tier 2: ${codexRelay.name} (no hostname; bound only to fake upstream)`);
-    console.log(`  tier 3: ${backend.name} (no hostname; served at ` +
+    console.log(`    ${readConfig(codexFakeUpstream.dir).name} (no hostname; fake data only)`);
+    console.log(`  tier 2: ${readConfig(codexRelay.dir).name} ` +
+        `(no hostname; bound only to fake upstream)`);
+    console.log(`  tier 3: ${readConfig(backend.dir).name} (no hostname; served at ` +
         `${baseUrl}/api), bound to the tier 1 previews, holding the ` +
         `${Object.keys(secrets).join(", ")} secrets`);
-    console.log(`  tier 4: ${router.name} -> ${baseUrl}, ` +
+    console.log(`  tier 4: ${readConfig(router.dir).name} -> ${baseUrl}, ` +
         "bound to every preview above");
+    if (deployMode === "named") {
+      console.log("  deploys ordinary Workers; service bindings use the unique sibling names");
+      console.log(`  secrets (${Object.keys({ ...secrets, ...relaySecrets }).join(", ")}) ` +
+          "are sent only over wrangler secret bulk stdin");
+    }
     return;
   }
 
   const wrangler = preparePreviewWrangler();
   try {
     await waitForAll([wrangler.ready, buildWorkspace()]);
+
+    if (deployMode === "named") {
+      await mapWithConcurrency([...gatekeepers, codexFakeUpstream], GATEKEEPER_CONCURRENCY,
+          (pkg) => deployNamedWorker(pkg, wrangler.command));
+      await deployNamedWorker(codexRelay, wrangler.command);
+      await uploadNamedSecrets(codexRelay, wrangler.command, relaySecrets);
+      await deployNamedWorker(backend, wrangler.command);
+      await uploadNamedSecrets(backend, wrangler.command, secrets);
+      await deployNamedWorker(router, wrangler.command);
+
+      const routerName = readConfig(router.dir).name;
+      console.log(`\nNamed fallback "${previewName}" is live at ${baseUrl}`);
+      writePreviewComment(baseUrl, previewName, readConfig(router.dir).account_id,
+          { deployMode, workerName: routerName });
+      return;
+    }
 
     // Keyed by worker name, because that is what a service binding names.
     const gatekeeperPreviews = await mapWithConcurrency(gatekeepers, GATEKEEPER_CONCURRENCY,
@@ -650,22 +759,34 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
 
 async function remove({ dryRun }: { dryRun: boolean }): Promise<void> {
   const previewName = resolvePreviewName();
+  const deployMode = resolvePreviewDeployMode();
   // Regenerate rather than assume: `delete` runs in its own CI job with a fresh checkout, and
   // wrangler needs a config to know which worker and account the preview belongs to.
-  const { packages } = generatePreviewConfigs({ previewName });
+  const { packages, configs } = generatePreviewConfigs({ previewName, deployMode });
   const { gatekeepers, codexFakeUpstream, codexRelay, backend, router } = tiers(packages);
 
   if (dryRun) {
-    console.log(`\ndry-run: would delete preview "${previewName}" for ` +
+    console.log(`\ndry-run: would delete ${deployMode === "named" ? "named fallback" : "preview"} ` +
+        `"${previewName}" for ` +
         [router, backend, codexRelay, codexFakeUpstream, ...gatekeepers]
-            .map((pkg) => pkg.name).join(", "));
+            .map((pkg) => readConfig(pkg.dir).name).join(", "));
+    if (deployMode === "named") {
+      console.log("  exact auto-provisioned resources: " +
+          namedAutoResources(configs).map(({ name }) => name).join(", "));
+    }
     return;
   }
 
   const wrangler = preparePreviewWrangler();
   try {
     await wrangler.ready;
-    await deletePreviewFrom(packages, previewName, wrangler.command);
+    if (deployMode === "named") {
+      await deleteNamedWorkers(packages, wrangler.command);
+      await cleanupNamedResources(
+          router, wrangler.command, previewName, namedAutoResources(configs));
+    } else {
+      await deletePreviewFrom(packages, previewName, wrangler.command);
+    }
   } finally {
     wrangler.cleanup();
   }
@@ -679,20 +800,97 @@ async function remove({ dryRun }: { dryRun: boolean }): Promise<void> {
 
 const PREVIEW_MAX_AGE_DAYS = 7;
 
-async function cloudflareApi(path: string): Promise<unknown> {
+async function cloudflareApi(
+  path: string,
+  { method = "GET" }: { method?: "GET" | "DELETE" } = {},
+): Promise<unknown> {
   if (!process.env.CLOUDFLARE_API_TOKEN) {
-    throw new Error("CLOUDFLARE_API_TOKEN is required to list previews");
+    throw new Error("CLOUDFLARE_API_TOKEN is required for preview API operations");
   }
   const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method,
     headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
   });
   const body = await response.json().catch(() => ({})) as
       { success?: boolean; errors?: unknown; result?: unknown };
   if (!response.ok || body.success === false) {
-    throw new Error(`Cloudflare API GET ${path} failed with ${response.status}: ` +
+    throw new Error(`Cloudflare API ${method} ${path} failed with ${response.status}: ` +
         JSON.stringify(body.errors ?? body));
   }
   return body.result;
+}
+
+async function emptyNamedR2Bucket(accountId: string, bucketName: string): Promise<void> {
+  const bucketPath = `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}`;
+  // The REST object API accepts the same API token as the deployment. Re-read page one after each
+  // batch instead of trusting a cursor whose collection is being modified underneath it. The
+  // Worker has already been deleted, so no legitimate writer remains and the loop converges.
+  for (;;) {
+    let listed: unknown;
+    try {
+      listed = await cloudflareApi(`${bucketPath}/objects?limit=1000`);
+    } catch (error) {
+      if (/not found|does not exist|10006|10007/i.test(describe(error))) return;
+      throw error;
+    }
+    const objects = Array.isArray(listed)
+      ? listed
+      : (listed && typeof listed === "object" && Array.isArray((listed as { objects?: unknown }).objects)
+          ? (listed as { objects: unknown[] }).objects : undefined);
+    if (!objects) {
+      throw new Error(`Expected an object list for exact named bucket ${bucketName}, got ` +
+          `${JSON.stringify(listed)?.slice(0, 200)}`);
+    }
+    if (objects.length === 0) return;
+    await mapWithConcurrency(objects, GATEKEEPER_CONCURRENCY, async (object) => {
+      const key = object && typeof object === "object" && "key" in object
+        ? (object as { key?: unknown }).key : undefined;
+      if (typeof key !== "string") {
+        throw new Error(`R2 listed an object without a string key in ${bucketName}`);
+      }
+      await cloudflareApi(`${bucketPath}/objects/${encodeURIComponent(key)}`, { method: "DELETE" });
+    });
+  }
+}
+
+/** Delete only the exact resource names derived from this named instance's generated configs. */
+async function cleanupNamedResources(
+  commandWorker: DeployablePackage,
+  wranglerCommand: string,
+  previewName: string,
+  resources: readonly NamedAutoResource[],
+): Promise<void> {
+  // Validate the complete set before the first irreversible request, not lazily while deleting.
+  assertNamedResourceScope(previewName, resources);
+  const accountId = readConfig(commandWorker.dir).account_id;
+  if (!accountId) throw new Error("named resource cleanup needs the generated account_id");
+  const failures: unknown[] = [];
+  for (const resource of resources) {
+    try {
+      if (resource.kind === "r2") await emptyNamedR2Bucket(accountId, resource.name);
+      const args = resource.kind === "kv"
+        ? ["kv", "namespace", "delete", resource.name, "-c", STAGING_CONFIG_NAME, "-y"]
+        : resource.kind === "r2"
+          ? ["r2", "bucket", "delete", resource.name, "-c", STAGING_CONFIG_NAME]
+          : ["d1", "delete", resource.name, "-c", STAGING_CONFIG_NAME, "-y"];
+      console.log(`deleting exact named ${resource.kind} resource: ${resource.name}`);
+      const result = await runWrangler(commandWorker, wranglerCommand, args);
+      writeCommandOutput(commandWorker, result);
+      if (result.status === 0) continue;
+      if (/not found|does not exist|10006|10007/i.test(`${result.stdout}\n${result.stderr}`)) {
+        console.warn(`Named ${resource.kind} resource ${resource.name} did not exist; continuing.`);
+        continue;
+      }
+      throw new Error(`failed to delete exact named ${resource.kind} resource ${resource.name} ` +
+          `(exit ${result.status})`);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const failure of failures.slice(1)) {
+    console.error(`Additional named resource cleanup failure: ${describe(failure)}`);
+  }
+  if (failures.length > 0) throw failures[0];
 }
 
 /**
@@ -817,6 +1015,11 @@ function staleReasons(preview: IndexedPreview, state: PullRequestState): string[
 }
 
 async function sweep({ dryRun }: { dryRun: boolean }): Promise<void> {
+  if (resolvePreviewDeployMode() === "named") {
+    throw new Error("PREVIEW_DEPLOY_MODE=named does not support account-wide sweep: normal " +
+        "Workers have no Worker Preview metadata. Run preview:delete with the original " +
+        "PREVIEW_NAME/PREVIEW_PR_NUMBER so cleanup stays exact-prefix scoped.");
+  }
   const { packages } = generatePreviewConfigs();
   const { router } = tiers(packages);
   const accountId = readConfig(router.dir).account_id;
