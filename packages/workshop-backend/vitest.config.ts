@@ -19,7 +19,6 @@ export default defineConfig({
           'experimental',
           'nodejs_compat',
           'enable_request_signal',
-          'enable_abortsignal_rpc',
         ],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },

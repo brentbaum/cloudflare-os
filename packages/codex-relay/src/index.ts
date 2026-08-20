@@ -1,11 +1,12 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import type {
-  CodexConnectionKey,
-  CodexDeviceAuthorization,
-  CodexDevicePollResult,
-  CodexRelayContract,
-  CodexRelayStatus,
+import {
+  CODEX_RELAY_CONNECTION_HEADER,
+  type CodexConnectionKey,
+  type CodexDeviceAuthorization,
+  type CodexDevicePollResult,
+  type CodexRelayContract,
+  type CodexRelayStatus,
 } from "@gadgets/workshop-shared/codex-relay";
 import { sanitizeUpstreamResponse } from "./policy.js";
 import { CodexAuth } from "./vault.js";
@@ -118,12 +119,14 @@ export class CodexRelay extends WorkerEntrypoint<Cloudflare.Env> implements Code
     return this.#connection(connection).disconnect();
   }
 
-  /** Relay one fixed-policy Codex Responses request. */
+  /** Relay one fixed-policy Codex Responses request over private HTTP service-binding transport. */
   @skipRpcValidation()
-  async infer(connection: CodexConnectionKey, request: Request): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
+    const connection = request.headers.get(CODEX_RELAY_CONNECTION_HEADER);
+    if (connection === null) return new Response("Not found", { status: 404 });
     const response = await this.#connection(connection).infer(request);
-    // Materialize a stream edge at each RPC hop so downstream cancellation reaches the DO-owned
-    // upstream reader rather than only releasing the outer capability proxy.
+    // Materialize a stream edge at the DO hop so downstream cancellation reaches its upstream
+    // reader while the outer binding stays on standard HTTP transport.
     return sanitizeUpstreamResponse(response);
   }
 }

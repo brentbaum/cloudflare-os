@@ -41,12 +41,12 @@ let relayRequestSignalAborted = false;
 
 /** Real validated relay with test-only observation of the backend-to-relay request signal. */
 export class CrossPackageCodexRelay extends ValidatedCodexRelay {
-  override async infer(connection: string, request: Request): Promise<Response> {
+  override async fetch(request: Request): Promise<Response> {
     relayRequestSignalAborted = request.signal.aborted;
     request.signal.addEventListener("abort", () => {
       relayRequestSignalAborted = true;
     }, { once: true });
-    return super.infer(connection, request);
+    return super.fetch(request);
   }
 
   readRequestSignalAborted(): boolean {

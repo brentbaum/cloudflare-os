@@ -1,7 +1,10 @@
 import { env } from "cloudflare:workers";
 import { reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CodexRelayContract } from "@gadgets/workshop-shared/codex-relay";
+import {
+  CODEX_RELAY_CONNECTION_HEADER,
+  type CodexRelayContract,
+} from "@gadgets/workshop-shared/codex-relay";
 import type { CodexAuth } from "../../src/vault.js";
 
 type TestUpstreamControl = {
@@ -36,6 +39,11 @@ const testEnv = env as unknown as {
 };
 
 const STATE_KEY = "codex-auth-state";
+
+function relayInference(connection: string, request: Request): Promise<Response> {
+  request.headers.set(CODEX_RELAY_CONNECTION_HEADER, connection);
+  return testEnv.CODEX_RELAY.fetch(request);
+}
 
 function deferred() {
   let resolve!: () => void;
@@ -387,7 +395,7 @@ describe("Codex vault branch coverage", () => {
     await (testEnv.CODEX_UPSTREAM as unknown as {
       rejectNextInferenceAsUnauthorized(): Promise<void>;
     }).rejectNextInferenceAsUnauthorized();
-    const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+    const response = await relayInference(name, inferenceRequest());
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   });

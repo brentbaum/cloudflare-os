@@ -20,6 +20,7 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { AiChatAuthorInfo, AiModelConfig, ApiKeyModelConfig, CodexModelConfig,
   SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
   from "@gadgets/workshop-shared/api";
+import { CODEX_RELAY_CONNECTION_HEADER } from "@gadgets/workshop-shared/codex-relay";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
@@ -688,7 +689,7 @@ function getCodexModel(
   }
   const catalog = codexCatalogModel(config.model);
   const relayFetch: FetchFunction = (input, init) =>
-    fetchCodexRelayUntilHeaders(relay, config.connection, input, init);
+    fetchCodexRelay(relay, config.connection, input, init);
 
   return makeHandle({
     model: {
@@ -705,39 +706,30 @@ function getCodexModel(
   });
 }
 
-type CodexInferenceRelay = Pick<NonNullable<ReturnType<typeof getCodexRelay>>, "infer">;
+type CodexInferenceRelay = Pick<NonNullable<ReturnType<typeof getCodexRelay>>, "fetch">;
 
 /**
- * Bridge Pi's fetch cancellation to the relay RPC only until response headers arrive.
+ * Forward Pi's request over supported HTTP service-binding transport.
  *
- * A serialized Request signal aborts the RPC invocation itself. After infer() has returned its
- * Response, Pi owns the response reader and its reader.cancel() is the single cancellation path
- * for the streaming body. Leaving the request signal linked after that point makes both paths race
- * in Workerd and can surface an unhandled "Stream was cancelled" rejection.
+ * The browser cannot select a credential namespace: this backend adapter overwrites the private
+ * routing header from its literal shared connection config. Standard Fetcher transport owns both
+ * request-signal and response-body cancellation propagation without experimental Workers RPC.
  */
-export async function fetchCodexRelayUntilHeaders(
+export async function fetchCodexRelay(
   relay: CodexInferenceRelay,
   connection: CodexModelConfig["connection"],
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
+  if (connection !== SHARED_CODEX_CONNECTION) {
+    throw new Error("Invalid shared Codex connection.");
+  }
   const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
   if (callerSignal?.aborted) throw callerSignal.reason;
 
-  const relayAbort = new AbortController();
-  const abortRelay = () => relayAbort.abort(callerSignal?.reason);
-  let listening = false;
-  if (callerSignal) {
-    callerSignal.addEventListener("abort", abortRelay, { once: true });
-    listening = true;
-  }
-
-  try {
-    const request = new Request(input, { ...init, signal: relayAbort.signal });
-    return await relay.infer(connection, request);
-  } finally {
-    if (listening && callerSignal) callerSignal.removeEventListener("abort", abortRelay);
-  }
+  const request = new Request(input, init);
+  request.headers.set(CODEX_RELAY_CONNECTION_HEADER, connection);
+  return relay.fetch(request);
 }
 
 // =======================================================================================

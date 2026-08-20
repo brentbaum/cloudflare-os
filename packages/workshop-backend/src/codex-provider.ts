@@ -24,7 +24,7 @@ export const CODEX_QUICK_MODEL_ID = "gpt-5.6-luna";
 
 type CodexModelId = typeof CODEX_MODEL_IDS[number];
 type CodexCatalogModel = Model<"openai-codex-responses">;
-type CodexRelayService = Service & CodexRelayContract;
+type CodexRelayService = Fetcher & CodexRelayContract;
 
 /** A projected profile and its non-secret, backend-generated routing configuration. */
 export type ProjectedCodexModel = {

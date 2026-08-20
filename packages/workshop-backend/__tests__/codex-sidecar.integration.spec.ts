@@ -247,7 +247,7 @@ describe("backend to private Codex sidecar lifecycle", () => {
     await bounded(testEnv.CODEX_UPSTREAM.waitForStreamCancellation(), "upstream stream cancellation");
     expect((await bounded(cancelled, "cancelled Pi result")).stopReason).toBe("aborted");
     await cancellableEvents.return?.();
-    expect(await testEnv.CODEX_RELAY.readRequestSignalAborted()).toBe(false);
+    expect(await testEnv.CODEX_RELAY.readRequestSignalAborted()).toBe(true);
     expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(1);
 
     // Exhaust the ordinary platform quota before taking the real authenticated workspace path.

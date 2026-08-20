@@ -2,6 +2,8 @@
 
 Private Cloudflare Worker sidecar that owns one Codex OAuth credential and exposes it only to the
 Workshop backend over a typed Service Binding. Its default HTTP entrypoint always returns 404.
+The private named entrypoint uses ordinary service-binding `fetch()` for streaming inference and
+Workers RPC only for sanitized connection lifecycle operations.
 
 This integration is experimental and for private deployments. It borrows the OAuth client identity
 used by the pinned Pi/OMP implementation and must not be distributed publicly or commercially

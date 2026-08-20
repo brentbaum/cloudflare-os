@@ -2,7 +2,10 @@ import { env } from "cloudflare:workers";
 import { abortAllDurableObjects, reset, runInDurableObject, SELF } from "cloudflare:test";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CodexRelayContract } from "@gadgets/workshop-shared/codex-relay";
+import {
+  CODEX_RELAY_CONNECTION_HEADER,
+  type CodexRelayContract,
+} from "@gadgets/workshop-shared/codex-relay";
 import type { CodexAuth } from "../../src/vault.js";
 import { MAX_INFERENCE_BODY_BYTES } from "../../src/policy.js";
 
@@ -63,6 +66,11 @@ function inferenceRequest(signal?: AbortSignal): Request {
     body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: "fake prompt" }),
     signal,
   });
+}
+
+function relayInference(connection: string, request: Request): Promise<Response> {
+  request.headers.set(CODEX_RELAY_CONNECTION_HEADER, connection);
+  return testEnv.CODEX_RELAY.fetch(request);
 }
 
 async function zstdInferenceRequest(body: unknown): Promise<Request> {
@@ -136,7 +144,7 @@ describe("Codex relay in Workerd", () => {
     await testEnv.CODEX_UPSTREAM.blockRefresh();
 
     const requests = Array.from({ length: 20 }, () =>
-      testEnv.CODEX_RELAY.infer("single-flight", inferenceRequest()),
+      relayInference("single-flight", inferenceRequest()),
     );
     await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
@@ -154,7 +162,7 @@ describe("Codex relay in Workerd", () => {
     const before = await testEnv.CODEX_RELAY.status(name);
     await testEnv.CODEX_UPSTREAM.blockRefresh();
 
-    const inference = statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest()));
+    const inference = statusAfterConsume(relayInference(name, inferenceRequest()));
     await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
     await testEnv.CODEX_RELAY.disconnect(name);
     const disconnected = await testEnv.CODEX_RELAY.status(name);
@@ -172,7 +180,7 @@ describe("Codex relay in Workerd", () => {
     await testEnv.CODEX_UPSTREAM.blockRefresh();
     await testEnv.CODEX_UPSTREAM.setRefreshMode("rate-limited");
 
-    const inference = statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest()));
+    const inference = statusAfterConsume(relayInference(name, inferenceRequest()));
     await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
     const newer = await testEnv.CODEX_RELAY.startLogin(name);
     await testEnv.CODEX_UPSTREAM.releaseRefresh();
@@ -353,7 +361,7 @@ describe("Codex relay in Workerd", () => {
       reason: "interrupted_refresh",
     });
     await expect(
-      statusAfterConsume(testEnv.CODEX_RELAY.infer("interrupted-marker", inferenceRequest())),
+      statusAfterConsume(relayInference("interrupted-marker", inferenceRequest())),
     ).resolves.toBe(401);
     expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(0);
   });
@@ -454,7 +462,7 @@ describe("Codex relay in Workerd", () => {
     await testEnv.CODEX_UPSTREAM.setRefreshMode("server-error");
 
     await expect(
-      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      statusAfterConsume(relayInference(name, inferenceRequest())),
     ).resolves.toBe(401);
     await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
       state: "reauth-required",
@@ -468,7 +476,7 @@ describe("Codex relay in Workerd", () => {
     await testEnv.CODEX_UPSTREAM.setRefreshMode("erroring-body");
 
     await expect(
-      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      statusAfterConsume(relayInference(name, inferenceRequest())),
     ).resolves.toBe(401);
     await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
       state: "reauth-required",
@@ -477,7 +485,7 @@ describe("Codex relay in Workerd", () => {
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
 
     await expect(
-      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      statusAfterConsume(relayInference(name, inferenceRequest())),
     ).resolves.toBe(401);
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
   });
@@ -490,7 +498,7 @@ describe("Codex relay in Workerd", () => {
     await testEnv.CODEX_UPSTREAM.blockRefresh();
 
     const coalescedPromise = Promise.all(
-      Array.from({ length: 20 }, () => testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      Array.from({ length: 20 }, () => relayInference(name, inferenceRequest())),
     );
     await testEnv.CODEX_UPSTREAM.waitForRefreshCalls(1);
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(1);
@@ -504,7 +512,7 @@ describe("Codex relay in Workerd", () => {
     await Promise.all(coalesced.slice(1).map((response) => response.arrayBuffer()));
 
     const blocked = await Promise.all(
-      Array.from({ length: 5 }, () => testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      Array.from({ length: 5 }, () => relayInference(name, inferenceRequest())),
     );
     expect(blocked.every((response) => response.status === 503)).toBe(true);
     expect(blocked.every((response) => response.headers.get("retry-after") === "300")).toBe(true);
@@ -531,7 +539,7 @@ describe("Codex relay in Workerd", () => {
     });
     await testEnv.CODEX_UPSTREAM.setRefreshMode("success");
 
-    const retried = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+    const retried = await relayInference(name, inferenceRequest());
     expect(retried.status).toBe(200);
     await retried.arrayBuffer();
     expect((await testEnv.CODEX_UPSTREAM.read()).refreshCalls).toBe(2);
@@ -552,7 +560,7 @@ describe("Codex relay in Workerd", () => {
     });
 
     await expect(
-      statusAfterConsume(testEnv.CODEX_RELAY.infer(name, inferenceRequest())),
+      statusAfterConsume(relayInference(name, inferenceRequest())),
     ).resolves.toBe(503);
     await expect(testEnv.CODEX_RELAY.status(name)).resolves.toMatchObject({
       state: "credential-state-unknown",
@@ -576,7 +584,7 @@ describe("Codex relay in Workerd", () => {
   it("refreshes and retries exactly once on a pre-stream 401", async () => {
     await connect("retry-once");
     await testEnv.CODEX_UPSTREAM.rejectNextInferenceAsUnauthorized();
-    const response = await testEnv.CODEX_RELAY.infer("retry-once", inferenceRequest());
+    const response = await relayInference("retry-once", inferenceRequest());
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(response.headers.get("x-request-id")).toBe("request-workerd-fake-2");
@@ -590,7 +598,7 @@ describe("Codex relay in Workerd", () => {
 
   it("validates Pi zstd input with decompression bounds and forwards normalized identity JSON", async () => {
     await connect("zstd-input");
-    const response = await testEnv.CODEX_RELAY.infer(
+    const response = await relayInference(
       "zstd-input",
       await zstdInferenceRequest({
         model: "gpt-5.6-sol",
@@ -610,7 +618,7 @@ describe("Codex relay in Workerd", () => {
       input: "x".repeat(MAX_INFERENCE_BODY_BYTES + 1),
     });
     await expect(
-      testEnv.CODEX_RELAY.infer("zstd-bomb", oversized).then(async (result) => ({
+      relayInference("zstd-bomb", oversized).then(async (result) => ({
         status: result.status,
         body: await result.json(),
       })),
@@ -624,7 +632,7 @@ describe("Codex relay in Workerd", () => {
     await connect("stream-cancel");
     await testEnv.CODEX_UPSTREAM.setStreamMode("cancellable");
     const abort = new AbortController();
-    const response = await testEnv.CODEX_RELAY.infer(
+    const response = await relayInference(
       "stream-cancel",
       inferenceRequest(abort.signal),
     );
@@ -649,7 +657,7 @@ describe("Codex relay in Workerd", () => {
       await connect(name);
       await testEnv.CODEX_UPSTREAM.configureSizedStream(totalBytes, chunkBytes);
 
-      const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+      const response = await relayInference(name, inferenceRequest());
       const headersReceivedAt = Date.now();
       expect(response.status).toBe(200);
       const reader = response.body?.getReader();
@@ -688,7 +696,7 @@ describe("Codex relay in Workerd", () => {
   it("preserves a premature SSE closure for downstream incomplete-stream classification", async () => {
     await connect("premature-stream");
     await testEnv.CODEX_UPSTREAM.setStreamMode("premature");
-    const response = await testEnv.CODEX_RELAY.infer("premature-stream", inferenceRequest());
+    const response = await relayInference("premature-stream", inferenceRequest());
     const reader = response.body?.getReader();
     const first = await reader?.read();
     expect(new TextDecoder().decode(first?.value)).toBe("data: fake-partial");
@@ -696,9 +704,12 @@ describe("Codex relay in Workerd", () => {
     expect((await testEnv.CODEX_UPSTREAM.read()).streamCancellations).toBe(0);
   });
 
-  it("keeps the public Worker dark and exposes management only over RPC", async () => {
+  it("keeps public HTTP dark and requires the private binding routing header", async () => {
     await expect(
       SELF.fetch("https://relay.invalid/").then((response) => response.status),
+    ).resolves.toBe(404);
+    await expect(
+      testEnv.CODEX_RELAY.fetch(inferenceRequest()).then((response) => response.status),
     ).resolves.toBe(404);
     await expect(testEnv.CODEX_RELAY.status("rpc-connection")).resolves.toMatchObject({
       state: "disconnected",

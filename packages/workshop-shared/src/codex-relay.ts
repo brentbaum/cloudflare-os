@@ -5,6 +5,9 @@
  */
 export type CodexConnectionKey = string;
 
+/** Private service-binding request header carrying the server-owned credential routing key. */
+export const CODEX_RELAY_CONNECTION_HEADER = "x-codex-relay-connection";
+
 /** Sanitized lifecycle state for one relay-owned Codex credential. */
 export type CodexRelayStatus =
   | { state: "disconnected"; connectionEpoch: string }
@@ -38,10 +41,11 @@ export type CodexDevicePollResult =
   | { state: "superseded" };
 
 /**
- * Private Service Binding contract implemented by the Codex relay WorkerEntrypoint.
+ * Private RPC management contract implemented by the Codex relay WorkerEntrypoint.
  *
- * OAuth authority never crosses this interface. Management results are sanitized and inference
- * accepts a Request capability whose destination and credential headers are replaced by the relay.
+ * OAuth authority never crosses this interface. Management results are sanitized. Inference uses
+ * the same binding's standard Fetcher interface so Request cancellation stays on supported HTTP
+ * service-binding transport.
  */
 export interface CodexRelayContract {
   /** Return sanitized connection state. */
@@ -55,7 +59,4 @@ export interface CodexRelayContract {
 
   /** Delete locally-held authority and invalidate projections tied to the old connection epoch. */
   disconnect(connection: CodexConnectionKey): Promise<void>;
-
-  /** Forward one fixed-policy Codex Responses request and stream the upstream response unchanged. */
-  infer(connection: CodexConnectionKey, request: Request): Promise<Response>;
 }

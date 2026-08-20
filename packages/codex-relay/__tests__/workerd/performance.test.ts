@@ -1,7 +1,10 @@
 import { env } from "cloudflare:workers";
 import { reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { CodexRelayContract } from "@gadgets/workshop-shared/codex-relay";
+import {
+  CODEX_RELAY_CONNECTION_HEADER,
+  type CodexRelayContract,
+} from "@gadgets/workshop-shared/codex-relay";
 import type { CodexAuth } from "../../src/vault.js";
 
 type TestUpstreamPerformanceControl = {
@@ -32,6 +35,11 @@ function inferenceRequest(signal?: AbortSignal): Request {
   });
 }
 
+function relayInference(connection: string, request: Request): Promise<Response> {
+  request.headers.set(CODEX_RELAY_CONNECTION_HEADER, connection);
+  return testEnv.CODEX_RELAY.fetch(request);
+}
+
 async function connect(name: string): Promise<void> {
   const stub = testEnv.CODEX_AUTH.getByName(name);
   const authorization = await testEnv.CODEX_RELAY.startLogin(name);
@@ -45,7 +53,7 @@ async function connect(name: string): Promise<void> {
 }
 
 async function consumeTimedFirstByte(name: string): Promise<number> {
-  const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest());
+  const response = await relayInference(name, inferenceRequest());
   const reader = response.body?.getReader();
   if (!reader) throw new Error("Missing timed fake response body");
   expect(await reader.read()).toMatchObject({ done: false });
@@ -88,7 +96,7 @@ describe("Codex relay local performance proxies", () => {
     await connect(name);
     await testEnv.CODEX_UPSTREAM.setStreamMode("cancellable");
     const abort = new AbortController();
-    const response = await testEnv.CODEX_RELAY.infer(name, inferenceRequest(abort.signal));
+    const response = await relayInference(name, inferenceRequest(abort.signal));
     const reader = response.body?.getReader();
     if (!reader) throw new Error("Missing cancellable fake response body");
     expect(await reader.read()).toMatchObject({ done: false });

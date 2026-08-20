@@ -26,10 +26,8 @@
     "enhanced_error_serialization",
     "global_fetch_strictly_public",
 
-    // relayFetch forwards the caller's AbortSignal through the CodexRelay service binding. Both
-    // flags are required for Request.signal cloning and cancellation propagation over Workers RPC.
+    // relayFetch forwards the caller's AbortSignal through standard HTTP service-binding fetch.
     "enable_request_signal",
-    "enable_abortsignal_rpc",
 
     // The pi-ai inference layer wraps the official provider SDKs (@anthropic-ai/sdk, openai,
     // @google/genai), which need Node compatibility. Puppeteer (used for Gadget PDF exports)

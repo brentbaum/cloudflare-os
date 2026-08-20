@@ -14,7 +14,6 @@ export default defineConfig({
           "experimental",
           "nodejs_compat",
           "enable_request_signal",
-          "enable_abortsignal_rpc",
         ],
         bindings: {
           ADMINS: JSON.stringify(["codexadmin"]),
@@ -49,9 +48,10 @@ export default defineConfig({
     include: ["__tests__/codex-sidecar.integration.spec.ts"],
     setupFiles: ["../../scripts/assert-workerd.ts"],
     testTimeout: 30_000,
-    // vitest-pool independently reports the pending RPC read cancellation after Pi handles it.
-    // Production has no suppression. Keep this dedicated-suite exception pinned to Pi 0.83's
-    // parseSSE frame; its truthful dist source map presents the runtime JS frame as the TS source.
+    // vitest-pool independently reports Pi's pending service-binding stream read cancellation
+    // after Pi handles it. Production has no suppression. Keep this dedicated-suite exception
+    // pinned to Pi 0.83's parseSSE frame; explicit assertions below the transport verify that the
+    // Pi result aborts, the request signal aborts, and the upstream body is cancelled exactly once.
     onUnhandledError(error) {
       if (typeof error !== "object" || error === null) return true;
       const message = "message" in error ? error.message : undefined;
