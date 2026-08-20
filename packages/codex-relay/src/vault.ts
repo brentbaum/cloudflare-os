@@ -1,0 +1,537 @@
+import { DurableObject } from "cloudflare:workers";
+import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import type {
+  CodexDeviceAuthorization,
+  CodexDevicePollResult,
+  CodexRelayStatus,
+} from "@gadgets/workshop-shared/codex-relay";
+import { type EncryptedEnvelope, WrappingKeyring } from "./crypto.js";
+import {
+  CODEX_DEVICE_VERIFICATION_URI,
+  type CodexCredential,
+  DEVICE_AUTHORIZATION_LIFETIME_MS,
+  OAuthProtocolError,
+  createFetchAdapter,
+  exchangeDeviceCode,
+  pollDeviceAuthorization,
+  refreshCodexCredential,
+  startDeviceAuthorization,
+} from "./oauth.js";
+import {
+  InferencePolicyError,
+  createUpstreamRequest,
+  policyErrorResponse,
+  sanitizeUpstreamResponse,
+  validateInferenceRequest,
+} from "./policy.js";
+
+const STATE_KEY = "codex-auth-state";
+const STATE_VERSION = 1 as const;
+const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+type RelayEnv = {
+  CODEX_WRAPPING_KEY_CURRENT: string;
+  CODEX_WRAPPING_KEY_PREVIOUS?: string;
+  CODEX_UPSTREAM?: Fetcher;
+};
+
+type StartingState = {
+  version: typeof STATE_VERSION;
+  state: "starting";
+  connectionEpoch: string;
+  attemptId: string;
+  expiresAt: number;
+  nextPollAt: number;
+};
+
+type PendingState = {
+  version: typeof STATE_VERSION;
+  state: "pending";
+  connectionEpoch: string;
+  attemptId: string;
+  expiresAt: number;
+  nextPollAt: number;
+  pollIntervalMs: number;
+  pending: EncryptedEnvelope;
+};
+
+type RefreshMarker = { generation: number; attemptId: string; startedAt: number };
+
+type ReadyState = {
+  version: typeof STATE_VERSION;
+  state: "ready";
+  connectionEpoch: string;
+  expiresAt: number;
+  generation: number;
+  credential: EncryptedEnvelope;
+  refresh?: RefreshMarker;
+};
+
+type StoredState =
+  | { version: typeof STATE_VERSION; state: "disconnected"; connectionEpoch: string }
+  | StartingState
+  | PendingState
+  | ReadyState
+  | {
+      version: typeof STATE_VERSION;
+      state: "reauth-required";
+      connectionEpoch: string;
+      reason: string;
+    }
+  | {
+      version: typeof STATE_VERSION;
+      state: "credential-state-unknown";
+      connectionEpoch: string;
+      reason: string;
+    };
+
+type PendingSecret = { deviceAuthId: string; userCode: string };
+type CredentialResolution = { credential: CodexCredential; refreshed: boolean };
+
+class AuthStateError extends Error {
+  constructor(
+    public readonly code:
+      | "disconnected"
+      | "reauth_required"
+      | "credential_state_unknown"
+      | "refresh_failed",
+  ) {
+    super(code);
+    this.name = "AuthStateError";
+  }
+}
+
+function newId(): string {
+  return crypto.randomUUID();
+}
+
+function authErrorResponse(error: unknown): Response {
+  if (error instanceof AuthStateError) {
+    const status =
+      error.code === "credential_state_unknown" || error.code === "refresh_failed" ? 503 : 401;
+    return Response.json(
+      { error: { code: error.code, message: "Codex authentication is unavailable" } },
+      { status },
+    );
+  }
+  return Response.json(
+    { error: { code: "relay_unavailable", message: "Codex relay is temporarily unavailable" } },
+    { status: 503 },
+  );
+}
+
+/** Durable credential vault and fixed-policy inference relay for one logical connection. */
+@validateRpc()
+export class CodexAuth extends DurableObject<RelayEnv> {
+  readonly #objectId = this.ctx.id.toString();
+  readonly #keyringPromise: Promise<WrappingKeyring>;
+  readonly #providerFetch: typeof fetch;
+  #refreshPromise?: Promise<CredentialResolution>;
+  #activeRefreshAttempt?: string;
+
+  constructor(ctx: DurableObjectState, env: RelayEnv) {
+    super(ctx, env);
+    this.#keyringPromise = WrappingKeyring.create(
+      env.CODEX_WRAPPING_KEY_CURRENT,
+      env.CODEX_WRAPPING_KEY_PREVIOUS,
+    );
+    this.#providerFetch = createFetchAdapter(env.CODEX_UPSTREAM);
+  }
+
+  #initialState(): StoredState {
+    return { version: STATE_VERSION, state: "disconnected", connectionEpoch: newId() };
+  }
+
+  async #readRawState(): Promise<StoredState> {
+    const state = await this.ctx.storage.get<StoredState>(STATE_KEY);
+    if (!state) {
+      const initial = this.#initialState();
+      await this.ctx.storage.put(STATE_KEY, initial);
+      return initial;
+    }
+    if (state.version !== STATE_VERSION) {
+      const unknown: StoredState = {
+        version: STATE_VERSION,
+        state: "credential-state-unknown",
+        connectionEpoch: newId(),
+        reason: "unsupported_state_version",
+      };
+      await this.ctx.storage.put(STATE_KEY, unknown);
+      return unknown;
+    }
+    return state;
+  }
+
+  async #readState(): Promise<StoredState> {
+    const state = await this.#readRawState();
+    if (state.state !== "ready" || !state.refresh) return state;
+    if (this.#refreshPromise && this.#activeRefreshAttempt === state.refresh.attemptId)
+      return state;
+    const unknown: StoredState = {
+      version: STATE_VERSION,
+      state: "credential-state-unknown",
+      connectionEpoch: state.connectionEpoch,
+      reason: "interrupted_refresh",
+    };
+    await this.ctx.storage.put(STATE_KEY, unknown);
+    return unknown;
+  }
+
+  #writeState(state: StoredState): Promise<void> {
+    return this.ctx.storage.put(STATE_KEY, state);
+  }
+
+  /** Return the non-secret connection status. */
+  async status(): Promise<CodexRelayStatus> {
+    const state = await this.#readState();
+    switch (state.state) {
+      case "starting":
+      case "pending":
+        return {
+          state: "pending",
+          connectionEpoch: state.connectionEpoch,
+          attemptId: state.attemptId,
+          expiresAt: state.expiresAt,
+          nextPollAt: state.nextPollAt,
+        };
+      case "ready":
+        return {
+          state: "ready",
+          connectionEpoch: state.connectionEpoch,
+          expiresAt: state.expiresAt,
+        };
+      case "reauth-required":
+        return { state: state.state, connectionEpoch: state.connectionEpoch, reason: state.reason };
+      case "credential-state-unknown":
+        return { state: state.state, connectionEpoch: state.connectionEpoch, reason: state.reason };
+      case "disconnected":
+        return { state: state.state, connectionEpoch: state.connectionEpoch };
+    }
+  }
+
+  /** Supersede any older login and start a fresh device-authorization attempt. */
+  async startLogin(): Promise<CodexDeviceAuthorization> {
+    const previous = await this.#readState();
+    const attemptId = newId();
+    const startedAt = Date.now();
+    const provisional: StartingState = {
+      version: STATE_VERSION,
+      state: "starting",
+      connectionEpoch: previous.connectionEpoch,
+      attemptId,
+      expiresAt: startedAt + DEVICE_AUTHORIZATION_LIFETIME_MS,
+      nextPollAt: startedAt,
+    };
+    await this.#writeState(provisional);
+
+    let authorization;
+    try {
+      authorization = await startDeviceAuthorization(this.#providerFetch);
+    } catch (error) {
+      const current = await this.#readRawState();
+      if (current.state === "starting" && current.attemptId === attemptId) {
+        await this.#writeState({
+          version: STATE_VERSION,
+          state: "disconnected",
+          connectionEpoch: current.connectionEpoch,
+        });
+      }
+      throw error;
+    }
+
+    const current = await this.#readRawState();
+    if (current.state !== "starting" || current.attemptId !== attemptId) {
+      throw new Error("Login attempt was superseded");
+    }
+    const keyring = await this.#keyringPromise;
+    const pending = await keyring.encrypt(
+      {
+        deviceAuthId: authorization.deviceAuthId,
+        userCode: authorization.userCode,
+      } satisfies PendingSecret,
+      this.#objectId,
+      "pending",
+    );
+    const afterEncryption = await this.#readRawState();
+    if (afterEncryption.state !== "starting" || afterEncryption.attemptId !== attemptId) {
+      throw new Error("Login attempt was superseded");
+    }
+    const now = Date.now();
+    const expiresAt = now + DEVICE_AUTHORIZATION_LIFETIME_MS;
+    const nextPollAt = now + authorization.pollIntervalMs;
+    await this.#writeState({
+      version: STATE_VERSION,
+      state: "pending",
+      connectionEpoch: afterEncryption.connectionEpoch,
+      attemptId,
+      expiresAt,
+      nextPollAt,
+      pollIntervalMs: authorization.pollIntervalMs,
+      pending,
+    });
+    return {
+      attemptId,
+      userCode: authorization.userCode,
+      verificationUri: CODEX_DEVICE_VERIFICATION_URI,
+      expiresAt,
+      pollIntervalMs: authorization.pollIntervalMs,
+    };
+  }
+
+  /** Perform at most one provider-paced poll for the current login attempt. */
+  async pollLogin(attemptId: string): Promise<CodexDevicePollResult> {
+    let state = await this.#readState();
+    if (
+      (state.state !== "pending" && state.state !== "starting") ||
+      state.attemptId !== attemptId
+    ) {
+      return { state: "superseded" };
+    }
+    const now = Date.now();
+    if (now >= state.expiresAt) {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "disconnected",
+        connectionEpoch: state.connectionEpoch,
+      });
+      return { state: "expired" };
+    }
+    if (state.state === "starting" || now < state.nextPollAt) {
+      return { state: "pending", nextPollAt: state.nextPollAt, expiresAt: state.expiresAt };
+    }
+
+    const reservedNextPollAt = now + state.pollIntervalMs;
+    state = { ...state, nextPollAt: reservedNextPollAt };
+    await this.#writeState(state);
+    const keyring = await this.#keyringPromise;
+    let secret: PendingSecret;
+    try {
+      secret = await keyring.decrypt<PendingSecret>(state.pending, this.#objectId, "pending");
+    } catch {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "credential-state-unknown",
+        connectionEpoch: state.connectionEpoch,
+        reason: "pending_state_decryption_failed",
+      });
+      throw new AuthStateError("credential_state_unknown");
+    }
+    const beforePoll = await this.#readRawState();
+    if (beforePoll.state !== "pending" || beforePoll.attemptId !== attemptId) {
+      return { state: "superseded" };
+    }
+    const poll = await pollDeviceAuthorization(
+      secret.deviceAuthId,
+      secret.userCode,
+      this.#providerFetch,
+    );
+    const current = await this.#readRawState();
+    if (current.state !== "pending" || current.attemptId !== attemptId)
+      return { state: "superseded" };
+
+    if (poll.state === "pending") {
+      const nextPollAt = Math.max(
+        Date.now() + current.pollIntervalMs,
+        poll.retryAfterMs === undefined ? 0 : Date.now() + poll.retryAfterMs,
+      );
+      await this.#writeState({ ...current, nextPollAt });
+      return { state: "pending", nextPollAt, expiresAt: current.expiresAt };
+    }
+    if (poll.state === "denied" || poll.state === "expired") {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "disconnected",
+        connectionEpoch: current.connectionEpoch,
+      });
+      return { state: poll.state };
+    }
+
+    const credential = await exchangeDeviceCode(
+      poll.authorizationCode,
+      poll.codeVerifier,
+      Date.now(),
+      this.#providerFetch,
+    );
+    const afterExchange = await this.#readRawState();
+    if (afterExchange.state !== "pending" || afterExchange.attemptId !== attemptId) {
+      return { state: "superseded" };
+    }
+    const encrypted = await keyring.encrypt(credential, this.#objectId, "credential");
+    const afterEncryption = await this.#readRawState();
+    if (afterEncryption.state !== "pending" || afterEncryption.attemptId !== attemptId) {
+      return { state: "superseded" };
+    }
+    const connectionEpoch = newId();
+    await this.#writeState({
+      version: STATE_VERSION,
+      state: "ready",
+      connectionEpoch,
+      expiresAt: credential.expiresAt,
+      generation: 1,
+      credential: encrypted,
+    });
+    return { state: "ready", connectionEpoch, expiresAt: credential.expiresAt };
+  }
+
+  async #resolveCredential(forceRefresh = false): Promise<CredentialResolution> {
+    if (this.#refreshPromise) return this.#refreshPromise;
+    const state = await this.#readState();
+    if (state.state === "reauth-required") throw new AuthStateError("reauth_required");
+    if (state.state === "credential-state-unknown")
+      throw new AuthStateError("credential_state_unknown");
+    if (state.state !== "ready") throw new AuthStateError("disconnected");
+    const keyring = await this.#keyringPromise;
+    let credential: CodexCredential;
+    try {
+      credential = await keyring.decrypt<CodexCredential>(
+        state.credential,
+        this.#objectId,
+        "credential",
+      );
+    } catch {
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "credential-state-unknown",
+        connectionEpoch: state.connectionEpoch,
+        reason: "credential_decryption_failed",
+      });
+      throw new AuthStateError("credential_state_unknown");
+    }
+    if (!forceRefresh && credential.expiresAt - Date.now() > REFRESH_MARGIN_MS) {
+      return { credential, refreshed: false };
+    }
+    if (this.#refreshPromise) return this.#refreshPromise;
+
+    const promise = this.#performRefresh(state, credential);
+    this.#refreshPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.#refreshPromise === promise) this.#refreshPromise = undefined;
+      this.#activeRefreshAttempt = undefined;
+    }
+  }
+
+  async #performRefresh(
+    state: ReadyState,
+    credential: CodexCredential,
+  ): Promise<CredentialResolution> {
+    const attemptId = newId();
+    const marker: RefreshMarker = {
+      generation: state.generation,
+      attemptId,
+      startedAt: Date.now(),
+    };
+    this.#activeRefreshAttempt = attemptId;
+    await this.#writeState({ ...state, refresh: marker });
+
+    let refreshed: CodexCredential;
+    try {
+      refreshed = await refreshCodexCredential(
+        credential.refreshToken,
+        Date.now(),
+        this.#providerFetch,
+      );
+    } catch (error) {
+      if (error instanceof OAuthProtocolError && error.kind === "invalid-grant") {
+        await this.#writeState({
+          version: STATE_VERSION,
+          state: "reauth-required",
+          connectionEpoch: state.connectionEpoch,
+          reason: "invalid_grant",
+        });
+        throw new AuthStateError("reauth_required");
+      }
+      if (error instanceof OAuthProtocolError && error.kind === "transient") {
+        await this.#writeState(state);
+        throw new AuthStateError("refresh_failed");
+      }
+      await this.#writeState({
+        version: STATE_VERSION,
+        state: "credential-state-unknown",
+        connectionEpoch: state.connectionEpoch,
+        reason: "ambiguous_refresh",
+      });
+      throw new AuthStateError("credential_state_unknown");
+    }
+
+    const current = await this.#readRawState();
+    if (
+      current.state !== "ready" ||
+      current.connectionEpoch !== state.connectionEpoch ||
+      current.generation !== state.generation ||
+      current.refresh?.attemptId !== attemptId
+    ) {
+      throw new AuthStateError("disconnected");
+    }
+    const keyring = await this.#keyringPromise;
+    const encrypted = await keyring.encrypt(refreshed, this.#objectId, "credential");
+    const next: ReadyState = {
+      version: STATE_VERSION,
+      state: "ready",
+      connectionEpoch: state.connectionEpoch,
+      expiresAt: refreshed.expiresAt,
+      generation: state.generation + 1,
+      credential: encrypted,
+    };
+    try {
+      await this.#writeState(next);
+    } catch {
+      try {
+        await this.#writeState({
+          version: STATE_VERSION,
+          state: "credential-state-unknown",
+          connectionEpoch: state.connectionEpoch,
+          reason: "refresh_commit_failed",
+        });
+      } catch {
+        // The durable marker remains, so the next invocation also fails closed.
+      }
+      throw new AuthStateError("credential_state_unknown");
+    }
+    return { credential: refreshed, refreshed: true };
+  }
+
+  /** Delete all pending/credential state and rotate the projection-invalidating epoch. */
+  async disconnect(): Promise<void> {
+    await this.#writeState({
+      version: STATE_VERSION,
+      state: "disconnected",
+      connectionEpoch: newId(),
+    });
+  }
+
+  /** Relay one bounded, validated Codex Responses request with DO-owned credentials. */
+  @skipRpcValidation()
+  async infer(request: Request): Promise<Response> {
+    let validated;
+    try {
+      validated = await validateInferenceRequest(request);
+    } catch (error) {
+      return error instanceof InferencePolicyError
+        ? policyErrorResponse(error)
+        : authErrorResponse(error);
+    }
+
+    try {
+      const resolution = await this.#resolveCredential();
+      let response = await this.#fetchUpstream(
+        createUpstreamRequest(validated.body, resolution.credential, request.signal),
+      );
+      if (response.status === 401 && !resolution.refreshed) {
+        await response.body?.cancel();
+        const retried = await this.#resolveCredential(true);
+        response = await this.#fetchUpstream(
+          createUpstreamRequest(validated.body, retried.credential, request.signal),
+        );
+      }
+      return sanitizeUpstreamResponse(response);
+    } catch (error) {
+      return authErrorResponse(error);
+    }
+  }
+
+  #fetchUpstream(request: Request): Promise<Response> {
+    return this.#providerFetch(request);
+  }
+}
