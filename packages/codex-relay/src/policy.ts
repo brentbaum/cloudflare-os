@@ -273,9 +273,19 @@ async function decodeInferenceBody(
     body.set(decoded);
     return body;
   } catch (error) {
-    if (error instanceof InferencePolicyError) throw error;
-    const decompressionCode = isRecord(error) ? error.code : undefined;
-    const decompressionMessage = isRecord(error) ? error.message : undefined;
+    // node:zlib's synchronous APIs throw Error instances. This defensive guard preserves a stable
+    // policy error if an alternate nodejs_compat runtime violates that contract, but no conforming
+    // runtime can drive it.
+    /* istanbul ignore next -- @preserve node:zlib always throws Error */
+    if (!(error instanceof Error)) {
+      throw new InferencePolicyError(
+        400,
+        "invalid_compressed_body",
+        "Inference request body is not valid zstd",
+      );
+    }
+    const decompressionCode = (error as Error & { code?: unknown }).code;
+    const decompressionMessage = error.message;
     if (
       decompressionCode === "ERR_BUFFER_TOO_LARGE" ||
       (typeof decompressionMessage === "string" &&
