@@ -687,10 +687,8 @@ function getCodexModel(
     throw new Error("The shared Codex subscription provider is not configured.");
   }
   const catalog = codexCatalogModel(config.model);
-  const relayFetch: FetchFunction = (input, init) => {
-    const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
-    return relay.infer(config.connection, request);
-  };
+  const relayFetch: FetchFunction = (input, init) =>
+    fetchCodexRelayUntilHeaders(relay, config.connection, input, init);
 
   return makeHandle({
     model: {
@@ -705,6 +703,41 @@ function getCodexModel(
       authorization: { mode: "external" },
     },
   });
+}
+
+type CodexInferenceRelay = Pick<NonNullable<ReturnType<typeof getCodexRelay>>, "infer">;
+
+/**
+ * Bridge Pi's fetch cancellation to the relay RPC only until response headers arrive.
+ *
+ * A serialized Request signal aborts the RPC invocation itself. After infer() has returned its
+ * Response, Pi owns the response reader and its reader.cancel() is the single cancellation path
+ * for the streaming body. Leaving the request signal linked after that point makes both paths race
+ * in Workerd and can surface an unhandled "Stream was cancelled" rejection.
+ */
+export async function fetchCodexRelayUntilHeaders(
+  relay: CodexInferenceRelay,
+  connection: CodexModelConfig["connection"],
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+  if (callerSignal?.aborted) throw callerSignal.reason;
+
+  const relayAbort = new AbortController();
+  const abortRelay = () => relayAbort.abort(callerSignal?.reason);
+  let listening = false;
+  if (callerSignal) {
+    callerSignal.addEventListener("abort", abortRelay, { once: true });
+    listening = true;
+  }
+
+  try {
+    const request = new Request(input, { ...init, signal: relayAbort.signal });
+    return await relay.infer(connection, request);
+  } finally {
+    if (listening && callerSignal) callerSignal.removeEventListener("abort", abortRelay);
+  }
 }
 
 // =======================================================================================

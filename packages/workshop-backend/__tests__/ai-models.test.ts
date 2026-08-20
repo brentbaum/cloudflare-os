@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { zstdDecompressSync } from "node:zlib";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
-import { getModel, type ModelHandle } from "../src/ai-models.js";
+import {
+  fetchCodexRelayUntilHeaders,
+  getModel,
+  type ModelHandle,
+} from "../src/ai-models.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
 // the returned handle's model descriptor (baseUrl/id/api) and log route, and request-level
@@ -230,6 +234,85 @@ describe("getModel AI Gateway routing", () => {
 });
 
 describe("getModel shared Codex relay routing", () => {
+  it("rejects an already-aborted call without dispatching it to the relay", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("already cancelled", "AbortError");
+    controller.abort(reason);
+    const relay = { infer: vi.fn() } as unknown as Parameters<
+      typeof fetchCodexRelayUntilHeaders
+    >[0];
+
+    await expect(fetchCodexRelayUntilHeaders(
+      relay,
+      "shared-v1",
+      new Request("https://chatgpt.com/backend-api/codex/responses", {
+        signal: controller.signal,
+      }),
+    )).rejects.toBe(reason);
+    expect(relay.infer).not.toHaveBeenCalled();
+  });
+
+  it("aborts the relay RPC before headers and removes its bridge listener", async () => {
+    const controller = new AbortController();
+    const input = new Request("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      body: "{}",
+      signal: controller.signal,
+    });
+    const addListener = vi.spyOn(input.signal, "addEventListener");
+    const removeListener = vi.spyOn(input.signal, "removeEventListener");
+    let capturedRequest: Request | undefined;
+    const relay = {
+      infer: vi.fn((_connection: string, request: Request) => {
+        capturedRequest = request;
+        return new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener("abort", () => reject(request.signal.reason), {
+            once: true,
+          });
+        });
+      }),
+    } as unknown as Parameters<typeof fetchCodexRelayUntilHeaders>[0];
+
+    const pending = fetchCodexRelayUntilHeaders(relay, "shared-v1", input);
+    await vi.waitFor(() => expect(relay.infer).toHaveBeenCalledOnce());
+    const bridgeListener = addListener.mock.calls.find(([type]) => type === "abort")?.[1];
+    expect(bridgeListener).toBeDefined();
+    expect(addListener).toHaveBeenCalledOnce();
+
+    const reason = new DOMException("cancel before headers", "AbortError");
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(capturedRequest?.signal.aborted).toBe(true);
+    expect(removeListener).toHaveBeenCalledWith("abort", bridgeListener);
+    expect(removeListener).toHaveBeenCalledOnce();
+  });
+
+  it("detaches its request-signal bridge as soon as response headers arrive", async () => {
+    const controller = new AbortController();
+    const input = new Request("https://chatgpt.com/backend-api/codex/responses", {
+      signal: controller.signal,
+    });
+    const addListener = vi.spyOn(input.signal, "addEventListener");
+    const removeListener = vi.spyOn(input.signal, "removeEventListener");
+    let capturedRequest: Request | undefined;
+    const relay = {
+      infer: vi.fn(async (_connection: string, request: Request) => {
+        capturedRequest = request;
+        return new Response("ok");
+      }),
+    } as unknown as Parameters<typeof fetchCodexRelayUntilHeaders>[0];
+
+    await fetchCodexRelayUntilHeaders(relay, "shared-v1", input);
+    const bridgeListener = addListener.mock.calls.find(([type]) => type === "abort")?.[1];
+    expect(bridgeListener).toBeDefined();
+    expect(addListener).toHaveBeenCalledOnce();
+    expect(removeListener).toHaveBeenCalledWith("abort", bridgeListener);
+    expect(removeListener).toHaveBeenCalledOnce();
+
+    controller.abort(new DOMException("cancel after headers", "AbortError"));
+    expect(capturedRequest?.signal.aborted).toBe(false);
+  });
+
   it("locks external auth, payload, relay fetch, SSE, and response-body cancellation", async () => {
     const within = <T>(promise: Promise<T>, label: string) => Promise.race([
       promise,
@@ -240,14 +323,13 @@ describe("getModel shared Codex relay routing", () => {
     let capturedConnection: string | undefined;
     let capturedRequest: Request | undefined;
     let capturedBody: Record<string, unknown> | undefined;
-    let markDispatched!: () => void;
+    let markHeaders!: () => void;
     let markCancelled!: () => void;
-    const dispatched = new Promise<void>((resolve) => { markDispatched = resolve });
+    const headers = new Promise<void>((resolve) => { markHeaders = resolve });
     const cancelled = new Promise<void>((resolve) => { markCancelled = resolve });
-    let bodyController: ReadableStreamDefaultController<Uint8Array>;
+    const cancelBody = vi.fn(() => { markCancelled() });
     const body = new ReadableStream<Uint8Array>({
-      start(controller) { bodyController = controller },
-      cancel() { markCancelled() },
+      cancel: cancelBody,
     });
     const relay = {
       infer: vi.fn(async (connection: string, request: Request) => {
@@ -258,11 +340,6 @@ describe("getModel shared Codex relay routing", () => {
           ? zstdDecompressSync(requestBytes)
           : requestBytes;
         capturedBody = JSON.parse(new TextDecoder().decode(bodyBytes)) as Record<string, unknown>;
-        request.signal.addEventListener("abort", () => {
-          markCancelled();
-          bodyController.error(request.signal.reason);
-        }, { once: true });
-        markDispatched();
         return new Response(body, {
           status: 200,
           headers: { "content-type": "text/event-stream" },
@@ -295,15 +372,10 @@ describe("getModel shared Codex relay routing", () => {
         Authorization: "must-be-removed",
         "chatgpt-account-id": "must-be-removed",
       },
+      onResponse: () => { markHeaders() },
     }).result();
 
-    const started = await within(Promise.race([
-      dispatched.then(() => ({ kind: "dispatched" as const })),
-      resultPromise.then((result) => ({ kind: "result" as const, result })),
-    ]), "relay dispatch");
-    if (started.kind === "result") {
-      throw new Error(`Codex stream stopped before relay dispatch: ${started.result.errorMessage}`);
-    }
+    await within(headers, "relay response headers");
     expect(capturedConnection).toBe("shared-v1");
     expect(capturedBody).toMatchObject({ model: "gpt-5.6-sol", stream: true, store: false });
     expect(capturedRequest?.headers.get("authorization")).toBeNull();
@@ -312,12 +384,14 @@ describe("getModel shared Codex relay routing", () => {
     expect(forbiddenFetch).not.toHaveBeenCalled();
 
     // The relay has returned response headers while its SSE body remains open. Aborting the turn
-    // must cancel that body rather than leaving the Service Binding stream hanging.
+    // must take only Pi's response reader.cancel() path. Re-aborting the serialized RPC request
+    // races the same stream cancellation inside Workerd and surfaces an unhandled rejection.
     controller.abort(new DOMException("fake cancellation", "AbortError"));
-    expect(capturedRequest?.signal.aborted).toBe(true);
+    expect(capturedRequest?.signal.aborted).toBe(false);
     await within(cancelled, "relay body cancellation");
     const result = await within(resultPromise, "aborted Pi result");
     expect(result.stopReason).toBe("aborted");
+    expect(cancelBody).toHaveBeenCalledOnce();
   });
 });
 
