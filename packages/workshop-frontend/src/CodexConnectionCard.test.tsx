@@ -15,11 +15,13 @@ import type {
 
 const mocks = vi.hoisted(() => {
   const toast = vi.fn<(toast: unknown) => void>()
-  return { toast, toastManager: { add: toast } }
+  return { toast, toastManager: { add: toast }, unstableToastManager: false }
 })
 
 vi.mock('@cloudflare/kumo', () => ({
-  useKumoToastManager: () => mocks.toastManager,
+  useKumoToastManager: () => mocks.unstableToastManager
+    ? { add: mocks.toast }
+    : mocks.toastManager,
 }))
 
 vi.mock('@phosphor-icons/react', () => ({
@@ -42,6 +44,7 @@ let root: Root
 
 beforeEach(() => {
   mocks.toast.mockReset()
+  mocks.unstableToastManager = false
   container = document.createElement('div')
   document.body.append(container)
   root = createRoot(container)
@@ -107,6 +110,21 @@ describe('CodexConnectionCard', () => {
       getCodexConnectionStatus: async () => ({ state: 'disabled' }),
     }))
     expect(container.textContent).toBe('')
+  })
+
+  it('loads disconnected status once when the toast manager identity changes every render', async () => {
+    mocks.unstableToastManager = true
+    const never = new Promise<CodexConnectionStatus>(() => {})
+    const getStatus = vi.fn<AdminApi['getCodexConnectionStatus']>()
+      .mockResolvedValueOnce({ state: 'disconnected', connectionEpoch: 'epoch-0' })
+      .mockImplementation(() => never)
+
+    await render(adminApi({ getCodexConnectionStatus: getStatus }))
+
+    expect(getStatus).toHaveBeenCalledOnce()
+    expect(container.textContent).toContain('Codex subscription')
+    expect(container.textContent).toContain('Not connected')
+    expect(container.textContent).toContain('Connect Codex')
   })
 
   it('shows ready and unknown-credential lifecycle states', async () => {

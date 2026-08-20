@@ -42,11 +42,13 @@ export function codexStatusReasonCopy(
 /** Admin-only lifecycle UI for the deployment-wide Codex subscription connection. */
 export default function CodexConnectionCard({ adminApi, onConnectionChange }: Props) {
   const toasts = useKumoToastManager()
+  const toastManager = useRef(toasts)
   const [status, setStatus] = useState<CodexConnectionStatus | null>(null)
   const [attempt, setAttempt] = useState<PendingAttempt | null>(null)
   const [busy, setBusy] = useState(false)
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollGeneration = useRef(0)
+  toastManager.current = toasts
 
   const invalidateLifecycle = useCallback(() => {
     pollGeneration.current += 1
@@ -70,18 +72,22 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
     await onConnectionChange()
     if (generation !== pollGeneration.current) return
     if (result.state === 'ready') {
-      toasts.add({ title: 'Codex subscription connected', variant: 'success' })
+      toastManager.current.add({ title: 'Codex subscription connected', variant: 'success' })
     } else if (result.state === 'denied') {
-      toasts.add({ title: 'Codex sign-in was denied', variant: 'error' })
+      toastManager.current.add({ title: 'Codex sign-in was denied', variant: 'error' })
     } else if (result.state === 'expired') {
-      toasts.add({ title: 'Codex sign-in expired', variant: 'error' })
+      toastManager.current.add({ title: 'Codex sign-in expired', variant: 'error' })
     } else if (result.state === 'superseded') {
-      toasts.add({ title: 'A newer Codex sign-in replaced this attempt', variant: 'error' })
+      toastManager.current.add({
+        title: 'A newer Codex sign-in replaced this attempt', variant: 'error',
+      })
     } else if (result.state === 'failed') {
-      toasts.add({ title: 'Codex sign-in failed. Start a new connection.', variant: 'error' })
+      toastManager.current.add({
+        title: 'Codex sign-in failed. Start a new connection.', variant: 'error',
+      })
     }
     return nextStatus
-  }, [onConnectionChange, toasts])
+  }, [onConnectionChange])
 
   const schedulePoll = useCallback((
     api: RpcStub<AdminApi>,
@@ -127,7 +133,7 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
                 }
               : null)
             schedulePoll(api, nextStatus.attemptId, nextStatus.nextPollAt, generation)
-            toasts.add({
+            toastManager.current.add({
               title: 'Codex sign-in check was interrupted. Retrying automatically.',
               variant: 'error',
             })
@@ -137,17 +143,17 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
           await onConnectionChange()
           if (generation !== pollGeneration.current) return
           if (nextStatus.state === 'ready') {
-            toasts.add({ title: 'Codex subscription connected', variant: 'success' })
+            toastManager.current.add({ title: 'Codex subscription connected', variant: 'success' })
           } else {
-            toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
+            toastManager.current.add({ title: 'Could not check Codex sign-in', variant: 'error' })
           }
         } catch {
           if (generation !== pollGeneration.current) return
-          toasts.add({ title: 'Could not check Codex sign-in', variant: 'error' })
+          toastManager.current.add({ title: 'Could not check Codex sign-in', variant: 'error' })
         }
       }
     }, Math.max(0, nextPollAt - Date.now()))
-  }, [finishAttempt, onConnectionChange, toasts])
+  }, [finishAttempt, onConnectionChange])
 
   useEffect(() => {
     const generation = invalidateLifecycle()
@@ -169,13 +175,13 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
       } catch (error) {
         if (generation !== pollGeneration.current) return
         console.error('Failed to load Codex connection:', error)
-        toasts.add({ title: 'Could not load Codex connection', variant: 'error' })
+        toastManager.current.add({ title: 'Could not load Codex connection', variant: 'error' })
       }
     })()
     return () => {
       invalidateLifecycle()
     }
-  }, [adminApi, invalidateLifecycle, schedulePoll, toasts])
+  }, [adminApi, invalidateLifecycle, schedulePoll])
 
   const startLogin = async () => {
     if (!adminApi || busy) return
@@ -200,7 +206,7 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
     } catch (error) {
       if (generation !== pollGeneration.current) return
       console.error('Failed to start Codex sign-in:', error)
-      toasts.add({ title: 'Could not start Codex sign-in', variant: 'error' })
+      toastManager.current.add({ title: 'Could not start Codex sign-in', variant: 'error' })
     } finally {
       if (generation === pollGeneration.current) setBusy(false)
     }
@@ -220,11 +226,11 @@ export default function CodexConnectionCard({ adminApi, onConnectionChange }: Pr
       setStatus(nextStatus)
       await onConnectionChange()
       if (generation !== pollGeneration.current) return
-      toasts.add({ title: 'Codex subscription disconnected', variant: 'success' })
+      toastManager.current.add({ title: 'Codex subscription disconnected', variant: 'success' })
     } catch (error) {
       if (generation !== pollGeneration.current) return
       console.error('Failed to disconnect Codex:', error)
-      toasts.add({ title: 'Could not disconnect Codex', variant: 'error' })
+      toastManager.current.add({ title: 'Could not disconnect Codex', variant: 'error' })
     } finally {
       if (generation === pollGeneration.current) setBusy(false)
     }
