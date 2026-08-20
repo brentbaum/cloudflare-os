@@ -853,6 +853,9 @@ importers:
       esbuild:
         specifier: ^0.28.1
         version: 0.28.1
+      miniflare:
+        specifier: 5.20260801.0-alpha
+        version: 5.20260801.0-alpha
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
