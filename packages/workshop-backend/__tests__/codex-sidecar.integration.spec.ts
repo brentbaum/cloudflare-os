@@ -26,7 +26,9 @@ type CrossPackageUpstreamControl = {
   setInitialExpiresIn(seconds: number): Promise<void>;
   blockRefresh(): Promise<void>;
   releaseRefresh(): Promise<void>;
-  setStreamMode(mode: "complete" | "cancellable"): Promise<void>;
+  setStreamMode(
+    mode: "complete" | "cancellable" | "tool-continuation" | "premature-close",
+  ): Promise<void>;
   waitForRefreshCalls(count: number): Promise<void>;
   waitForInferenceCalls(count: number): Promise<void>;
   waitForStreamCancellation(): Promise<void>;
@@ -270,9 +272,16 @@ describe("backend to private Codex sidecar lifecycle", () => {
     const workspaceInferenceStart = (await testEnv.CODEX_UPSTREAM.read()).inferenceCalls;
     const historicalModelId = codexProfileId("gpt-5.6-sol");
     using workspace = await user.newGadget();
+    const image = await workspace.uploadChatAttachment({
+      mimeType: "image/png",
+      name: "authenticated-cross-package.png",
+      content: new Uint8Array([0x89, 0x50, 0x4E, 0x47]),
+    }, historicalModelId);
     const chatId = await workspace.newChat(
       "Exercise the authenticated workspace Codex path",
       historicalModelId,
+      undefined,
+      [image],
     );
     // The primary Sol turn and catalog-pinned Luna title turn both traverse the relay.
     await bounded(
@@ -295,6 +304,9 @@ describe("backend to private Codex sidecar lifecycle", () => {
     expect(workspaceBodies.some((body) =>
       JSON.stringify(body).includes("Exercise the authenticated workspace Codex path")
     )).toBe(true);
+    expect(workspaceBodies.some((body) =>
+      JSON.stringify(body).includes("data:image/png;base64,iVBOR")
+    )).toBe(true);
     expect(JSON.stringify(workspaceBodies)).not.toMatch(
       /platform-(?:gateway|account|token)-must-not-cross|user-gateway-(?:account|token)-must-not-cross/,
     );
@@ -305,6 +317,46 @@ describe("backend to private Codex sidecar lifecycle", () => {
     );
     // Codex did not merely sneak through an exhausted check: the ordinary quota was untouched.
     expect(await user.getCloudflareUsage()).toMatchObject({ dailyUsed: 1, remaining: 0 });
+
+    await testEnv.CODEX_UPSTREAM.setStreamMode("tool-continuation");
+    const toolInferenceStart = workspaceUpstream.inferenceCalls;
+    const toolChatId = await workspace.newChat(
+      "Exercise multi-turn function continuation",
+      historicalModelId,
+    );
+    // Initial tool call, catalog-pinned Luna title, and post-tool continuation.
+    await bounded(
+      testEnv.CODEX_UPSTREAM.waitForInferenceCalls(toolInferenceStart + 3),
+      "multi-turn tool continuation",
+    );
+    await waitForChatIdle(workspace, toolChatId);
+    const toolHistory = await workspace.getChatHistory(toolChatId);
+    expect(toolHistory.messages.some((message) =>
+      message.type === "message" && message.author.type === "agent" &&
+      message.toolCalls?.some((tool) => tool.toolName === "observeUserChanges")
+    )).toBe(true);
+    expect(toolHistory.messages).toContainEqual(expect.objectContaining({
+      author: expect.objectContaining({ type: "agent", id: historicalModelId }),
+      type: "message",
+      message: "Tool continuation complete",
+    }));
+    const toolBodies = (await testEnv.CODEX_UPSTREAM.read()).inferenceBodies
+      .slice(toolInferenceStart);
+    expect(toolBodies.some((body) => JSON.stringify(body).includes("function_call_output")))
+      .toBe(true);
+
+    await testEnv.CODEX_UPSTREAM.setStreamMode("premature-close");
+    const prematureChatId = await workspace.newChat(
+      "Exercise premature SSE closure",
+      historicalModelId,
+    );
+    const prematureChat = await waitForChatIdle(workspace, prematureChatId);
+    expect(prematureChat.totalCost).toBeUndefined();
+    const prematureHistory = await workspace.getChatHistory(prematureChatId);
+    expect(prematureHistory.messages.some((message) =>
+      message.type === "error" && message.author.type === "agent" &&
+      /ended before a terminal response event/i.test(message.message)
+    )).toBe(true);
 
     await adminApi.disconnectCodex();
     expect((await adminApi.getCodexConnectionStatus()).state).toBe("disconnected");

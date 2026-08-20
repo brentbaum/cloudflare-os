@@ -26,7 +26,7 @@ export {
 // does not transform decorator sources outside this package root.
 export { CodexAuth } from "../../codex-relay/.wrangler/validate/src/index.js";
 
-type StreamMode = "complete" | "cancellable";
+type StreamMode = "complete" | "cancellable" | "tool-continuation" | "premature-close";
 
 let initialExpiresIn = 3600;
 let refreshCalls = 0;
@@ -113,6 +113,71 @@ function semanticSse(text = "Cross-package hello"): string {
     "data: [DONE]\n\n";
 }
 
+function toolCallSse(): string {
+  const item = {
+    type: "function_call",
+    id: "function_cross_package_fake",
+    call_id: "call_cross_package_fake",
+    name: "observeUserChanges",
+    arguments: "{}",
+    status: "completed",
+  };
+  const events = [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...item, arguments: "", status: "in_progress" },
+    },
+    {
+      type: "response.function_call_arguments.delta",
+      output_index: 0,
+      delta: "{}",
+    },
+    {
+      type: "response.function_call_arguments.done",
+      output_index: 0,
+      arguments: "{}",
+    },
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        status: "completed",
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          total_tokens: 2,
+          input_tokens_details: { cached_tokens: 0 },
+        },
+      },
+    },
+  ];
+  return `${events.map((event) => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n` +
+    "data: [DONE]\n\n";
+}
+
+function prematurelyClosedSse(): string {
+  const events = [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "message_premature_cross_package_fake",
+        role: "assistant",
+        status: "in_progress",
+        content: [],
+      },
+    },
+    {
+      type: "response.output_text.delta",
+      output_index: 0,
+      delta: "This partial output must not be accepted",
+    },
+  ];
+  return `${events.map((event) => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+}
+
 /** Test-only OAuth/Codex upstream for the backend-to-relay Workerd lifecycle test. */
 export class CrossPackageCodexUpstream extends WorkerEntrypoint {
   async fetch(request: Request): Promise<Response> {
@@ -142,7 +207,8 @@ export class CrossPackageCodexUpstream extends WorkerEntrypoint {
     if (url.pathname === "/backend-api/codex/responses") {
       inferenceCalls++;
       lastInferenceHeaders = Object.fromEntries(request.headers);
-      inferenceBodies.push(await request.json<Record<string, unknown>>());
+      const body = await request.json<Record<string, unknown>>();
+      inferenceBodies.push(body);
       if (streamMode === "cancellable") {
         let first = true;
         let heartbeat: ReturnType<typeof setTimeout> | undefined;
@@ -191,7 +257,21 @@ export class CrossPackageCodexUpstream extends WorkerEntrypoint {
         });
         return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
       }
-      return new Response(semanticSse(), {
+      let responseBody = semanticSse();
+      if (streamMode === "premature-close") {
+        responseBody = prematurelyClosedSse();
+      } else if (streamMode === "tool-continuation") {
+        const serialized = JSON.stringify(body);
+        const hasWorkshopTools = Array.isArray(body.tools) && body.tools.some((tool) =>
+          typeof tool === "object" && tool !== null && "name" in tool &&
+          tool.name === "observeUserChanges");
+        if (hasWorkshopTools && !serialized.includes("function_call_output")) {
+          responseBody = toolCallSse();
+        } else if (hasWorkshopTools) {
+          responseBody = semanticSse("Tool continuation complete");
+        }
+      }
+      return new Response(responseBody, {
         headers: {
           "Content-Type": "text/event-stream",
           "Set-Cookie": "must-not-cross=fake",
