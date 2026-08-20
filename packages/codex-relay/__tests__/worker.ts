@@ -128,10 +128,12 @@ export class TestUpstream extends WorkerEntrypoint {
   }
 
   async waitForRefreshCalls(count: number): Promise<void> {
+    // eslint-disable-next-line no-unmodified-loop-condition -- fetch() updates module state.
     while (refreshCalls < count) await new Promise((resolve) => setTimeout(resolve, 1));
   }
 
   async waitForStreamCancellation(): Promise<void> {
+    // eslint-disable-next-line no-unmodified-loop-condition -- stream cancellation updates module state.
     while (streamCancellations === 0) await new Promise((resolve) => setTimeout(resolve, 1));
   }
 

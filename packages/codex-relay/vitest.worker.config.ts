@@ -1,5 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
+import { kCurrentWorker } from "miniflare";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -9,8 +10,15 @@ export default defineConfig({
       main: "./__tests__/worker.ts",
       miniflare: {
         compatibilityDate: "2026-02-02",
+        bindings: {
+          CODEX_WRAPPING_KEY_CURRENT: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        },
         durableObjects: {
           CODEX_AUTH: { className: "CodexAuth", useSQLite: true },
+        },
+        serviceBindings: {
+          CODEX_RELAY: { name: kCurrentWorker, entrypoint: "CodexRelay" },
+          CODEX_UPSTREAM: { name: kCurrentWorker, entrypoint: "TestUpstream" },
         },
       },
     }),

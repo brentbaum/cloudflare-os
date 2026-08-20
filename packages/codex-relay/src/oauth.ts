@@ -80,7 +80,7 @@ function errorCode(body: unknown): string | undefined {
   return typeof value === "string" ? value.trim().toLowerCase() : undefined;
 }
 
-function retryAfterMs(response: Response): number | undefined {
+function parseRetryAfterMs(response: Response): number | undefined {
   const value = response.headers.get("retry-after");
   if (!value) return undefined;
   const seconds = Number(value);
@@ -133,7 +133,7 @@ export async function startDeviceAuthorization(
       "transient",
       "Device authorization is temporarily unavailable",
       response.status,
-      retryAfterMs(response),
+      parseRetryAfterMs(response),
     );
   }
   const body = await responseBody(response);
@@ -179,7 +179,7 @@ export async function pollDeviceAuthorization(
   const body = await responseBody(response);
   const code = errorCode(body);
   if (response.status === 429 || code === "slow_down") {
-    return { state: "pending", retryAfterMs: retryAfterMs(response) };
+    return { state: "pending", retryAfterMs: parseRetryAfterMs(response) };
   }
   if (response.status === 410 || code === "expired_token" || code === "expired")
     return { state: "expired" };
@@ -301,7 +301,7 @@ export async function refreshCodexCredential(
         "transient",
         "Credential refresh was rate limited",
         response.status,
-        retryAfterMs(response),
+        parseRetryAfterMs(response),
       );
     }
     throw new OAuthProtocolError(
