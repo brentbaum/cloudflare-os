@@ -15,7 +15,12 @@ export default defineConfig({
       main: './src/server.ts',
       miniflare: {
         compatibilityDate: '2026-02-02',
-        compatibilityFlags: ['experimental', 'nodejs_compat'],
+        compatibilityFlags: [
+          'experimental',
+          'nodejs_compat',
+          'enable_request_signal',
+          'enable_abortsignal_rpc',
+        ],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
         },

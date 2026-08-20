@@ -1073,6 +1073,8 @@
         "allow_irrevocable_stub_storage",
         "enhanced_error_serialization",
         "global_fetch_strictly_public",
+        "enable_request_signal",
+        "enable_abortsignal_rpc",
         "nodejs_compat"
       ],
       "gatekeeperBindingExpansion": {
