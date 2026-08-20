@@ -20,6 +20,11 @@ name: Preview
 # that a future edit which weakens the trigger still does not leak the token. They are not what
 # makes this safe today.
 #
+# Preview infrastructure is intentionally enabled only for the canonical repository and the
+# brentbaum integration fork. Keep that explicit owner allowlist on every privileged job: allowing
+# an arbitrary fork owner would make its repository secrets sufficient to run modified workflow
+# code, while the same-repository and maintainer checks below protect pull-request runs.
+#
 # The `cache: pnpm` below is deliberate and is not a poisoning path: a fork PR's Actions cache is
 # scoped to `refs/pull/<n>/merge` and cannot be read from another PR or from `main`.
 
@@ -48,7 +53,7 @@ jobs:
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
       github.event.pull_request.user.type != 'Bot' &&
       github.head_ref != 'main' &&
-      github.repository_owner == 'cloudflare'
+      contains(fromJSON('["cloudflare", "brentbaum"]'), github.repository_owner)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -172,7 +177,7 @@ jobs:
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
       github.event.pull_request.user.type != 'Bot' &&
       github.head_ref != 'main' &&
-      github.repository_owner == 'cloudflare'
+      contains(fromJSON('["cloudflare", "brentbaum"]'), github.repository_owner)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
@@ -229,7 +234,7 @@ jobs:
     name: Sweep abandoned previews
     if: >-
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-      github.repository_owner == 'cloudflare'
+      contains(fromJSON('["cloudflare", "brentbaum"]'), github.repository_owner)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
