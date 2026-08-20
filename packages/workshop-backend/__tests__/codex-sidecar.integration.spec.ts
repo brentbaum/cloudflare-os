@@ -19,6 +19,7 @@ import {
   codexProfileId,
 } from "../src/codex-provider.js";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
+import type { UserDurableObject } from "../src/user.js";
 
 type CrossPackageUpstreamControl = {
   reset(): Promise<void>;
@@ -52,20 +53,9 @@ const STATE_KEY = "codex-auth-state";
 const PASSWORD_HASH = new Uint8Array([11, 22, 33]);
 const CODEX_PROFILE_IDS = CODEX_MODEL_IDS.map(codexProfileId);
 
-type UserQuotaControl = {
-  consumeDailyLlmCall(limit: number): Promise<{
-    withinLimits: boolean;
-    remaining: number;
-    limit: number;
-    used: number;
-  }>;
-};
-
 const runtimeExports = workerExports as unknown as {
   default: Fetcher;
-  UserDurableObject: {
-    getByName(name: string): UserQuotaControl;
-  };
+  UserDurableObject: DurableObjectNamespace<UserDurableObject>;
 };
 
 async function bounded<T>(promise: PromiseLike<T>, label: string, timeoutMs = 3_000): Promise<T> {
@@ -104,6 +94,16 @@ async function waitForChatIdle(
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   })(), "workspace Codex turn", 8_000);
+}
+
+async function rejection(value: PromiseLike<unknown>): Promise<Error> {
+  try {
+    await value;
+  } catch (error) {
+    if (error instanceof Error) return error;
+    throw new TypeError("Expected RPC to reject with an Error.", { cause: error });
+  }
+  throw new Error("Expected RPC to reject.");
 }
 
 async function createAuthenticated(
@@ -317,11 +317,9 @@ describe("backend to private Codex sidecar lifecycle", () => {
     expect(unavailable.errorMessage).toMatch(/authentication|disconnected|unavailable/i);
     expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(beforeUnavailable);
 
-    await expect(workspace.sendChatMessage(
-      chatId,
-      "This historical chat must require reconnect",
-      historicalModelId,
-    )).rejects.toThrow(
+    const historicalChatError = await runInDurableObject(quotaUser, async (instance) =>
+      rejection(instance.getChatContext(historicalModelId)));
+    expect(historicalChatError.message).toBe(
       "The shared Codex connection is unavailable. Ask a deployment administrator to reconnect it.",
     );
     expect((await testEnv.CODEX_UPSTREAM.read()).inferenceCalls).toBe(beforeUnavailable);

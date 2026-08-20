@@ -20,6 +20,8 @@ export default defineConfig({
           ADMINS: JSON.stringify(["codexadmin"]),
           CODEX_SUBSCRIPTION_ENABLED: "true",
           CODEX_WRAPPING_KEY_CURRENT: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+          ENABLE_CLOUDFLARE_LIMITS: "true",
+          DAILY_LLM_CALL_LIMIT: "1",
           CF_AI_GATEWAY: "platform-gateway-must-not-cross",
           CF_AI_GATEWAY_ACCOUNT_ID: "platform-account-must-not-cross",
           CF_AI_GATEWAY_API_TOKEN: "platform-token-must-not-cross",

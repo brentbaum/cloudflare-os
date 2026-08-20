@@ -146,6 +146,7 @@ export class CrossPackageCodexUpstream extends WorkerEntrypoint {
       if (streamMode === "cancellable") {
         let first = true;
         let heartbeat: ReturnType<typeof setTimeout> | undefined;
+        let resolveHeartbeat: (() => void) | undefined;
         let cancellationObserved = false;
         const observeCancellation = () => {
           if (cancellationObserved) return;
@@ -172,8 +173,10 @@ export class CrossPackageCodexUpstream extends WorkerEntrypoint {
               return;
             }
             await new Promise<void>((resolve) => {
+              resolveHeartbeat = resolve;
               heartbeat = setTimeout(() => {
                 heartbeat = undefined;
+                resolveHeartbeat = undefined;
                 controller.enqueue(new TextEncoder().encode(": cross-package-heartbeat\n\n"));
                 resolve();
               }, 10);
@@ -181,6 +184,8 @@ export class CrossPackageCodexUpstream extends WorkerEntrypoint {
           },
           cancel() {
             if (heartbeat) clearTimeout(heartbeat);
+            resolveHeartbeat?.();
+            resolveHeartbeat = undefined;
             observeCancellation();
           },
         });
