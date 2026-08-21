@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { zstdDecompressSync } from "node:zlib";
 import type {
   Context,
   FetchFunction,
@@ -221,6 +222,78 @@ describe("pi Codex external authorization contract", () => {
 
     expect(result.stopReason).toBe("aborted");
     expect(dispatchedSignal?.aborted).toBe(true);
+    expect(injectedFetch).toHaveBeenCalledOnce();
+    expect(ambientFetch).not.toHaveBeenCalled();
+  });
+
+  it("does not replay the output-only reasoning content field on a later Codex turn", async () => {
+    const ambientFetch = stubAmbientFetch();
+    const reasoningSignature = {
+      id: "rs_reasoning_fake",
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "Fake private reasoning summary" }],
+      content: [],
+      encrypted_content: "encrypted_reasoning_fake",
+    };
+    const context = {
+      messages: [
+        { role: "user", content: "First turn", timestamp: 0 },
+        {
+          role: "assistant",
+          content: [{
+            type: "thinking",
+            thinking: "Fake private reasoning summary",
+            thinkingSignature: JSON.stringify(reasoningSignature),
+          }],
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          model: "gpt-5.6-luna",
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 1,
+        },
+        { role: "user", content: "Second turn", timestamp: 2 },
+      ],
+    } as Context;
+    let replayedReasoning: Record<string, unknown> | undefined;
+    const injectedFetch = vi.fn<FetchFunction>(async (input, init) => {
+      const request = new Request(input, init);
+      const encoded = new Uint8Array(await request.arrayBuffer());
+      const decoded = request.headers.get("content-encoding") === "zstd"
+        ? zstdDecompressSync(encoded)
+        : encoded;
+      const payload = JSON.parse(new TextDecoder().decode(decoded)) as {
+        input?: Record<string, unknown>[];
+      };
+      replayedReasoning = payload.input?.find(item => item.type === "reasoning");
+      if (replayedReasoning && Object.hasOwn(replayedReasoning, "content")) {
+        return Response.json({
+          error: { message: "Reasoning item field content is not enabled" },
+        }, { status: 400 });
+      }
+      return sseResponse("Second turn succeeds");
+    });
+
+    const result = await streamOpenAICodexResponses(
+      MODEL,
+      context,
+      externalOptions({ fetch: injectedFetch }),
+    ).result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(replayedReasoning).toEqual({
+      id: "rs_reasoning_fake",
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "Fake private reasoning summary" }],
+      encrypted_content: "encrypted_reasoning_fake",
+    });
     expect(injectedFetch).toHaveBeenCalledOnce();
     expect(ambientFetch).not.toHaveBeenCalled();
   });
