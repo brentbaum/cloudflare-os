@@ -131,7 +131,9 @@ The deployment binds that adapter to one VPC Service:
 ]
 ```
 
-The VPC Service is pinned to one named Tunnel, hostname `localhost`, and the loopback host's port.
+The VPC Service is pinned to one named Tunnel, hostname `127.0.0.1`, and the loopback host's port.
+Using `localhost` caused intermittent connector attempts to `::1`, which failed because the host
+intentionally listens only on IPv4 loopback. Pinning `127.0.0.1` removed that ambiguity.
 The host itself:
 
 - binds only to `127.0.0.1`;
@@ -202,4 +204,4 @@ The design preserves the original security boundary:
 
 ## Related Issues
 
-No related issues documented yet.
+- See also: [Codex reasoning content replay breaks later turns](reasoning-content-replay-codex-relay-20260821.md)

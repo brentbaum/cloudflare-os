@@ -12,8 +12,10 @@ CODEX_EGRESS_PORT=8790 pnpm --filter @gadgets/codex-egress-host start
 ```
 
 The server binds only to `127.0.0.1`. Configure the VPC Service with type `http`, hostname
-`localhost`, and the same port. It exposes `GET /health` for a credential-free private-path probe;
-all other traffic must be `POST /backend-api/codex/responses`. The host is an inference transport
+`127.0.0.1`, and the same port. Do not use `localhost`: tunnel connectors may resolve it to `::1`
+even though this deliberately loopback-only server listens on IPv4. It exposes `GET /health` for a
+credential-free private-path probe; all other traffic must be `POST /backend-api/codex/responses`.
+The host is an inference transport
 only—the relay Durable Object remains the sole OAuth credential and refresh-token owner.
 
 For a durable deployment, run this package and `cloudflared` under the host's process supervisor.

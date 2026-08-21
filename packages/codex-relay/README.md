@@ -59,7 +59,9 @@ validated inference request through `@gadgets/codex-egress-host` on a trusted ma
 
 1. Start the loopback egress host and a remotely managed Cloudflare Tunnel connector on that
    machine. The connector token must stay in process memory or the machine's secret manager.
-2. Create an HTTP VPC Service pinned to that tunnel, hostname `localhost`, and the egress port.
+2. Create an HTTP VPC Service pinned to that tunnel, hostname `127.0.0.1`, and the egress port.
+   Pin IPv4 explicitly because `localhost` may resolve to `::1`, while the egress host intentionally
+   binds only to IPv4 loopback.
 3. Add the resulting service to the relay deployment config:
 
    ```jsonc
