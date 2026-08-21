@@ -146,6 +146,7 @@ export function codexUpstreamHeaders(
     "Content-Type": "application/json",
     "OpenAI-Beta": "responses=experimental",
     Originator: "pi",
+    "User-Agent": "pi (cloudflare-worker)",
     Version: "0.144.1",
   });
 }

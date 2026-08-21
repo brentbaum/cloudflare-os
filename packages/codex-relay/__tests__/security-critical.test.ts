@@ -122,6 +122,7 @@ describe("security-critical relay decisions", () => {
       "content-type": "application/json",
       "openai-beta": "responses=experimental",
       originator: "pi",
+      "user-agent": "pi (cloudflare-worker)",
       version: "0.144.1",
     });
     expect(requestHeaders.has("cookie")).toBe(false);

@@ -33,6 +33,7 @@ import {
   sameReadyIdentity,
   terminalPollResult,
 } from "./security-critical.js";
+import { createInferenceFetch } from "./egress.js";
 
 const STATE_KEY = "codex-auth-state";
 const STATE_VERSION = 1 as const;
@@ -42,6 +43,7 @@ type RelayEnv = {
   CODEX_WRAPPING_KEY_CURRENT: string;
   CODEX_WRAPPING_KEY_PREVIOUS?: string;
   CODEX_UPSTREAM?: Fetcher;
+  CODEX_EGRESS?: Fetcher;
 };
 
 type StartingState = {
@@ -178,6 +180,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
   readonly #objectId = this.ctx.id.toString();
   readonly #keyringPromise: Promise<WrappingKeyring>;
   readonly #providerFetch: typeof fetch;
+  readonly #inferenceFetch: typeof fetch;
   #refreshPromise?: Promise<CredentialResolution>;
   #activeRefreshAttempt?: string;
 
@@ -188,6 +191,7 @@ export class CodexAuth extends DurableObject<RelayEnv> {
       env.CODEX_WRAPPING_KEY_PREVIOUS,
     );
     this.#providerFetch = createFetchAdapter(env.CODEX_UPSTREAM);
+    this.#inferenceFetch = createInferenceFetch(env.CODEX_EGRESS, this.#providerFetch);
   }
 
   #initialState(): StoredState {
@@ -689,6 +693,6 @@ export class CodexAuth extends DurableObject<RelayEnv> {
   }
 
   #fetchUpstream(request: Request): Promise<Response> {
-    return this.#providerFetch(request);
+    return this.#inferenceFetch(request);
   }
 }

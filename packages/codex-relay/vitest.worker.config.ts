@@ -20,6 +20,7 @@ export default defineConfig({
         serviceBindings: {
           CODEX_RELAY: { name: kCurrentWorker, entrypoint: "CodexRelay" },
           CODEX_UPSTREAM: { name: kCurrentWorker, entrypoint: "TestUpstream" },
+          CODEX_EGRESS: { name: kCurrentWorker, entrypoint: "TestUpstream" },
         },
       },
     }),

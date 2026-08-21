@@ -73,6 +73,7 @@ describe("security-critical relay decisions in Workerd", () => {
 
     const upstream = codexUpstreamHeaders({ accessToken: "token_fake", accountId: "account_fake" });
     expect(upstream.get("authorization")).toBe("Bearer token_fake");
+    expect(upstream.get("user-agent")).toBe("pi (cloudflare-worker)");
     expect(upstream.has("cookie")).toBe(false);
     expect(
       codexDownstreamHeaders(new Headers({ "X-Request-Id": "fake", "Set-Cookie": "secret" })),

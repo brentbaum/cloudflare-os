@@ -1,0 +1,16 @@
+{
+  "name": "@gadgets/codex-egress-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --experimental-strip-types src/server.ts",
+    "test:run": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.0",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -50,3 +50,31 @@ existing encrypted Durable Object state unreadable:
 
 Run `pnpm --filter @gadgets/codex-relay types:check` in CI to ensure the type artifact generated
 from `wrangler.private.jsonc` has not drifted.
+
+## Optional Tunnel/VPC inference egress
+
+Some upstream bot controls challenge requests that originate directly from the Workers network.
+Deployments affected by that behavior can keep OAuth state in `CodexAuth` while routing only the
+validated inference request through `@gadgets/codex-egress-host` on a trusted machine:
+
+1. Start the loopback egress host and a remotely managed Cloudflare Tunnel connector on that
+   machine. The connector token must stay in process memory or the machine's secret manager.
+2. Create an HTTP VPC Service pinned to that tunnel, hostname `localhost`, and the egress port.
+3. Add the resulting service to the relay deployment config:
+
+   ```jsonc
+   "vpc_services": [
+     { "binding": "CODEX_EGRESS", "service_id": "<vpc-service-id>" }
+   ]
+   ```
+
+4. Before any real inference, use a remote-development Worker with the same VPC binding to request
+   `http://codex-egress.internal/health` and require an exact `200 ok` response.
+
+When `CODEX_EGRESS` is absent, the relay preserves direct Worker egress. When it is present, the
+relay pins the internal authority and path before calling the VPC binding. OAuth start, poll,
+exchange, and refresh remain direct Worker calls, and no credential is copied to the egress host.
+
+The desktop host is suitable for a proof but not an availability target. Move the same process to
+a supervised trusted host before depending on it continuously. `cloudflared` 2025.7.0 or newer and
+outbound QUIC on UDP 7844 are required.

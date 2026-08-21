@@ -31,6 +31,7 @@ type TestUpstreamControl = {
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
     lastInferenceBody: string;
+    lastInferenceUrl: string;
     streamBytesProduced: number;
     streamBytesProducedAtHeaders: number;
     streamProductionCompletedAt: number;
@@ -608,6 +609,9 @@ describe("Codex relay in Workerd", () => {
     );
     expect(response.status).toBe(200);
     const upstream = await testEnv.CODEX_UPSTREAM.read();
+    expect(upstream.lastInferenceUrl).toBe(
+      "http://codex-egress.internal/backend-api/codex/responses",
+    );
     expect(upstream.lastInferenceHeaders["content-encoding"]).toBeUndefined();
     expect(upstream.lastInferenceBody).toContain("fake zstd prompt");
     await expect(response.text()).resolves.toContain("fake-complete");

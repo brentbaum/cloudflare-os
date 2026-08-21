@@ -20,6 +20,7 @@ let refreshGate: Promise<void> | undefined;
 let releaseRefreshGate: (() => void) | undefined;
 let lastInferenceHeaders: Record<string, string> = {};
 let lastInferenceBody = "";
+let lastInferenceUrl = "";
 let exchangeMode: ExchangeMode = "success";
 let refreshMode: RefreshMode = "success";
 let refreshRetryAfterSeconds = 1;
@@ -128,6 +129,7 @@ export class TestUpstream extends WorkerEntrypoint {
     }
     if (url.pathname === "/backend-api/codex/responses") {
       inferenceCalls++;
+      lastInferenceUrl = request.url;
       lastInferenceHeaders = Object.fromEntries(request.headers);
       lastInferenceBody = await request.clone().text();
       if (unauthorizedOnce) {
@@ -244,6 +246,7 @@ export class TestUpstream extends WorkerEntrypoint {
     releaseRefreshGate = undefined;
     lastInferenceHeaders = {};
     lastInferenceBody = "";
+    lastInferenceUrl = "";
     exchangeMode = "success";
     refreshMode = "success";
     refreshRetryAfterSeconds = 1;
@@ -400,6 +403,7 @@ export class TestUpstream extends WorkerEntrypoint {
     streamCancellations: number;
     lastInferenceHeaders: Record<string, string>;
     lastInferenceBody: string;
+    lastInferenceUrl: string;
     streamBytesProduced: number;
     streamBytesProducedAtHeaders: number;
     streamProductionCompletedAt: number;
@@ -413,6 +417,7 @@ export class TestUpstream extends WorkerEntrypoint {
       streamCancellations,
       lastInferenceHeaders,
       lastInferenceBody,
+      lastInferenceUrl,
       streamBytesProduced,
       streamBytesProducedAtHeaders,
       streamProductionCompletedAt,
